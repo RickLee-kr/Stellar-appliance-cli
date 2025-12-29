@@ -91,6 +91,8 @@ class AellaCli(cmd.Cmd, object):
             'restart': 'Restart System Or Service',
             'disk_encrypt': 'Execute operations of disk encryption',
             'clear': 'Clear History',
+            'monitor': 'Monitor VM resources and system health',
+            'health': 'Check system health status',
             'quit': 'Exit CLI',
             'help': 'Display Help Information  ',
         }
@@ -109,6 +111,7 @@ class AellaCli(cmd.Cmd, object):
             'route': 'Show Routing Table', 
             'cli': 'Show CLI History',
             'patch_history': 'Show the History of Patches Applied',
+            'autostart': 'Show VM Auto Start Configuration',
         }
 
         # Show command callback
@@ -125,6 +128,7 @@ class AellaCli(cmd.Cmd, object):
             'route': self.show_route_callback,
             'cli': self.show_cli_callback,
             'patch_history': self.show_patch_history_callback,
+            'autostart': self.show_autostart_callback,
         }
 
         # Set command help
@@ -136,6 +140,7 @@ class AellaCli(cmd.Cmd, object):
             'interface': 'Configure Interface Parameters',
             'hostname': 'Configure Host Name',
             'patches': 'Apply patches/update',
+            'autostart': 'Configure VM Auto Start',
         }
 
         # Set command callback
@@ -148,6 +153,7 @@ class AellaCli(cmd.Cmd, object):
             'hostname': self.set_hostname_callback,
             'patches': self.set_patches_callback,
             'patch': self.set_patches_callback,
+            'autostart': self.set_autostart_callback,
         }
 
         self.unset_command_help = {
@@ -160,69 +166,37 @@ class AellaCli(cmd.Cmd, object):
             'interface': self.unset_interface_callback
         }
 
-        self.start_command_help = {
-            'mds2': 'Start mds2',
-            'dl-master': 'Start dl-master',
-            'da-master': 'Start da-master',
-            'mds': 'Start mds',
-        }
+        # Dynamically build start command help and callback from virsh list
+        self.start_command_help = {}
+        self.start_command_callback = {}
+        vm_list = self.get_vm_list()
+        for vm in vm_list:
+            self.start_command_help[vm] = 'Start {}'.format(vm)
+            self.start_command_callback[vm] = self._create_vm_start_callback(vm)
 
-        self.start_command_callback = {
-            'mds2': self.start_mds2_callback,
-            'dl-master': self.start_dl_master_callback,
-            'da-master': self.start_da_master_callback,
-            'dr-master': self.start_da_master_callback,
-            'mds': self.start_mds_callback,
-        }
+        # Dynamically build restart command help and callback from virsh list
+        self.restart_command_help = {'system': 'Reboot appliance'}
+        self.restart_command_callback = {'system': self.restart_system_callback}
+        vm_list = self.get_vm_list()
+        for vm in vm_list:
+            self.restart_command_help[vm] = 'Restart {}'.format(vm)
+            self.restart_command_callback[vm] = self._create_vm_restart_callback(vm)
 
-        self.restart_command_help = {
-            'mds2': 'Restart mds2',
-            'dl-master': 'Restart dl-master',
-            'da-master': 'Restart da-master',
-            'mds': 'Restart mds',
-            'system': 'Reboot appliance'
-        }
+        # Dynamically build shutdown command help and callback from virsh list
+        self.shutdown_command_help = {'system': 'Shutdown appliance'}
+        self.shutdown_command_callback = {'system': self.shutdown_system_callback}
+        vm_list = self.get_vm_list()
+        for vm in vm_list:
+            self.shutdown_command_help[vm] = 'Shutdown {}'.format(vm)
+            self.shutdown_command_callback[vm] = self._create_vm_shutdown_callback(vm)
 
-        self.restart_command_callback = {
-            'mds2': self.restart_mds2_callback,
-            'dl-master': self.restart_dl_master_callback,
-            'da-master': self.restart_da_master_callback,
-            'dr-master': self.restart_da_master_callback,
-            'mds': self.restart_mds_callback,
-            'system': self.restart_system_callback,
-        }
-
-        self.shutdown_command_help = {
-            'mds2': 'Shutdown mds2',
-            'dl-master': 'Shutdown dl-master',
-            'da-master': 'Shutdown da-master (aka dr-master)',
-            'mds': 'Shutdown mds',
-            'system': 'Shutdown appliance'
-        }
-
-        self.shutdown_command_callback = {
-            'mds2': self.shutdown_mds2_callback,
-            'dl-master': self.shutdown_dl_master_callback,
-            'da-master': self.shutdown_da_master_callback,
-            'dr-master': self.shutdown_da_master_callback,
-            'mds': self.shutdown_mds_callback,
-            'system': self.shutdown_system_callback,
-        }
-
-        self.console_command_help = {
-            'mds2': 'Goto mds2 console',
-            'dl-master': 'Goto dl-master console',
-            'da-master': 'Goto da-master console',
-            'mds': 'Goto mds console',
-        }
-
-        self.console_command_callback = {
-            'mds2': self.console_mds2_callback,
-            'dl-master': self.console_dl_master_callback,
-            'da-master': self.console_da_master_callback,
-            'dr-master': self.console_da_master_callback,
-            'mds': self.console_mds_callback,
-        }
+        # Dynamically build console command help and callback from virsh list
+        self.console_command_help = {}
+        self.console_command_callback = {}
+        vm_list = self.get_vm_list()
+        for vm in vm_list:
+            self.console_command_help[vm] = 'Goto {} console'.format(vm)
+            self.console_command_callback[vm] = self._create_vm_console_callback(vm)
 
         self.clear_command_help = {
             'cli': 'Clear CLI history',
@@ -232,11 +206,29 @@ class AellaCli(cmd.Cmd, object):
             'cli': self.clear_cli_callback,
         }
 
+        # Monitor command
+        self.monitor_command_help = {
+            'vm': 'Monitor VM resource usage',
+        }
+
+        self.monitor_command_callback = {
+            'vm': self.monitor_vm_callback,
+        }
+
+        # Health command
+        self.health_command_help = {
+            'check': 'Check system health status',
+        }
+
+        self.health_command_callback = {
+            'check': self.health_check_callback,
+        }
+
         # Shell command
         self.shell_command = [
-            'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip'
+            'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip', 'dig'
         ]
-        self.shell_pass = '779ca0b4352457ecca7df0a0413f3674'
+        self.shell_pass = '0238b57cd42b4aa6b85991ea28702133'
 
         # Disk Encryption
         self.disk_encrypt_command_help = {
@@ -286,6 +278,20 @@ class AellaCli(cmd.Cmd, object):
                 return 'da-master'
         except Exception:
             return 'dr-master'
+
+    @staticmethod
+    def get_vm_list():
+        """Get list of all VMs from virsh list --all"""
+        vm_list = []
+        try:
+            cmd = "virsh list --all --name 2>/dev/null"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if out:
+                vm_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
+        except Exception:
+            pass
+        return vm_list
 
     def completenames(self, text, line, begidx, endidx):
         if not text:
@@ -398,20 +404,43 @@ class AellaCli(cmd.Cmd, object):
         else:
             print('Restarting operation aborted.')
 
-    def restart_mds_callback(self, key, param):
-        self.shell_cmd_exec('virsh reboot mds')
+    def _create_vm_start_callback(self, vm_name):
+        """Create a callback function for starting a VM"""
+        def callback(key, param):
+            # Special handling for dl-master
+            if vm_name == 'dl-master':
+                if not self.deu.ensure_open_encrypted_disk():
+                    self.deu.print_log("Failed to prepare stellar data disk", level=logging.ERROR)
+                    return
+            self.shell_cmd_exec('virsh start {}'.format(vm_name))
+        return callback
 
-    def restart_mds2_callback(self, key, param):
-        self.shell_cmd_exec('virsh reboot mds2')
+    def _create_vm_restart_callback(self, vm_name):
+        """Create a callback function for restarting a VM"""
+        def callback(key, param):
+            self.shell_cmd_exec('virsh reboot {}'.format(vm_name))
+        return callback
 
-    def restart_dl_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh reboot dl-master')
+    def _create_vm_shutdown_callback(self, vm_name):
+        """Create a callback function for shutting down a VM"""
+        def callback(key, param):
+            # Special handling for dl-master
+            if vm_name == 'dl-master':
+                for vm in self.deu.get_vm_names(services=("dl-master",)):
+                    if not self.deu.shutdown_vm(vm, destroy=False):
+                        print("\nWARNING: Failed to shutdown dl-master gracefully and will kill dl-master.")
+                        if not self.deu.double_confirm() or not self.deu.destroy_vm(vm):
+                            return
+                self.deu.ensure_close_encrypted_disk()
+            else:
+                self.shell_cmd_exec('virsh shutdown {}'.format(vm_name))
+        return callback
 
-    def restart_dr_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh reboot {}'.format(self.get_da_name()))
-
-    def restart_da_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh reboot {}'.format(self.get_da_name()))
+    def _create_vm_console_callback(self, vm_name):
+        """Create a callback function for console access to a VM"""
+        def callback(key, param):
+            subprocess.call('virsh console --force {}'.format(vm_name), shell=True)
+        return callback
 
     def complete_start(self, text, line, begidx, endidx):
         if not text:
@@ -425,23 +454,6 @@ class AellaCli(cmd.Cmd, object):
         """ Start command """
         return self._on_nested_command(line, self.start_command_help, self.start_command_callback)
 
-    def start_mds_callback(self, key, param):
-        self.shell_cmd_exec('virsh start mds')
-
-    def start_mds2_callback(self, key, param):
-        self.shell_cmd_exec('virsh start mds2')
-
-    def start_dl_master_callback(self, key, param):
-        if not self.deu.ensure_open_encrypted_disk():
-            self.deu.print_log("Failed to prepare stellar data disk", level=logging.ERROR)
-            return
-        self.shell_cmd_exec('virsh start dl-master')
-
-    def start_dr_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh start {}'.format(self.get_da_name()))
-
-    def start_da_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh start {}'.format(self.get_da_name()))
 
     def shutdown_system_callback(self, key, param):
         ans = ""
@@ -453,37 +465,6 @@ class AellaCli(cmd.Cmd, object):
         else:
             print('Shutdown operation aborted.')
 
-    def shutdown_mds_callback(self, key, param):
-        self.shell_cmd_exec('virsh shutdown mds')
-
-    def shutdown_mds2_callback(self, key, param):
-        self.shell_cmd_exec('virsh shutdown mds2')
-
-    def shutdown_dl_master_callback(self, key, param):
-        for vm in self.deu.get_vm_names(services=("dl-master",)):
-            if not self.deu.shutdown_vm(vm, destroy=False):
-                print("\nWARNING: Failed to shutdown dl-master gracefully and will kill dl-master.")
-                if not self.deu.double_confirm() or not self.deu.destroy_vm(vm):
-                    return
-        self.deu.ensure_close_encrypted_disk()
-
-    def shutdown_da_master_callback(self, key, param):
-        self.shell_cmd_exec('virsh shutdown {}'.format(self.get_da_name()))
-
-    @staticmethod
-    def console_mds_callback(key, param):
-        subprocess.call("virsh console --force mds", shell=True)
-
-    @staticmethod
-    def console_mds2_callback(key, param):
-        subprocess.call("virsh console --force mds2", shell=True)
-
-    @staticmethod
-    def console_dl_master_callback(key, param):
-        subprocess.call("virsh console --force dl-master", shell=True)
-
-    def console_da_master_callback(self, key, param):
-        subprocess.call('virsh console --force {}'.format(self.get_da_name()), shell=True)
 
     # Quit command
     @log_cmd
@@ -506,6 +487,18 @@ class AellaCli(cmd.Cmd, object):
         """ Show command """
         return self._on_nested_command(line, self.clear_command_help, self.clear_command_callback)
 
+    # Monitor command
+    @log_cmd
+    def do_monitor(self, line):
+        """ Monitor command """
+        return self._on_nested_command(line, self.monitor_command_help, self.monitor_command_callback)
+
+    # Health command
+    @log_cmd
+    def do_health(self, line):
+        """ Health command """
+        return self._on_nested_command(line, self.health_command_help, self.health_command_callback)
+
     # Console command
     @log_cmd
     def do_console(self, line):
@@ -513,6 +506,13 @@ class AellaCli(cmd.Cmd, object):
         return self._on_nested_command(line, self.console_command_help, self.console_command_callback)
 
     # Shutdown command
+    def complete_shutdown(self, text, line, begidx, endidx):
+        if not text:
+            completions = self.shutdown_command_help.keys()
+        else:
+            completions = [f for f in self.shutdown_command_help.keys() if f.startswith(text)]
+        return completions
+
     @log_cmd
     def do_shutdown(self, line):
         """Shutdown command """
@@ -846,6 +846,29 @@ class AellaCli(cmd.Cmd, object):
     def show_service(self, key, param):
         if key:
             self.shell_cmd_exec('sudo virsh list --all')
+
+    def show_autostart_callback(self, key, param):
+        """Show VM auto start configuration"""
+        vm_list = self.get_vm_list()
+        if not vm_list:
+            print('\nNo VMs found.\n')
+            return
+
+        print('\nVM Auto Start Configuration:')
+        print('-' * 50)
+        for vm in sorted(vm_list):
+            try:
+                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'autostart'".format(vm)
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc.communicate()
+                if out and 'enabled' in out.decode('utf-8', errors='ignore').lower():
+                    status = 'enabled'
+                else:
+                    status = 'disabled'
+                print('  {:<20} {}'.format(vm, status))
+            except Exception:
+                print('  {:<20} unknown'.format(vm))
+        print('')
 
     def show_interface_callback(self, key, param):
         if self.is_sensor_host_mode():
@@ -1315,6 +1338,80 @@ class AellaCli(cmd.Cmd, object):
         except Exception as e:
             print("Failed to apply updates {}".format(e))
 
+    def set_autostart_callback(self, key, param):
+        """Configure VM auto start"""
+        if not param or len(param) < 1:
+            print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
+            print('                             If enable/disable is omitted, it will toggle the current state\n')
+            return
+
+        vm_name = param[0].rstrip('?')
+        if param[0].endswith('?') or vm_name == '?':
+            print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
+            print('                             If enable/disable is omitted, it will toggle the current state\n')
+            return
+
+        # Check if VM exists
+        vm_list = self.get_vm_list()
+        if vm_name not in vm_list:
+            print('VM "{}" not found. Available VMs: {}'.format(vm_name, ', '.join(vm_list) if vm_list else 'none'))
+            return
+
+        # Get enable/disable option
+        enable = None
+        if len(param) >= 2:
+            option = param[1].lower().rstrip('?')
+            if option == 'enable':
+                enable = True
+            elif option == 'disable':
+                enable = False
+            elif option == '?' or param[1].endswith('?'):
+                print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
+                print('                             If enable/disable is omitted, it will toggle the current state\n')
+                return
+            else:
+                print('Invalid option: Available options are "enable" and "disable"')
+                print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start\n')
+                return
+
+        # If enable/disable not specified, check current state and toggle
+        if enable is None:
+            try:
+                cmd = "virsh dominfo {} | grep -i 'autostart'".format(vm_name)
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc.communicate()
+                if out:
+                    # Check if autostart is enabled
+                    if 'enabled' in out.decode('utf-8', errors='ignore').lower():
+                        enable = False  # Toggle to disable
+                    else:
+                        enable = True   # Toggle to enable
+                else:
+                    # If we can't determine, default to enable
+                    enable = True
+            except Exception:
+                # If check fails, default to enable
+                enable = True
+
+        # Execute virsh autostart command
+        try:
+            if enable:
+                cmd = "virsh autostart {}".format(vm_name)
+                result = subprocess.call(cmd, shell=True)
+                if result == 0:
+                    print("VM '{}' auto start enabled successfully.\n".format(vm_name))
+                else:
+                    print("Failed to enable auto start for VM '{}'.\n".format(vm_name))
+            else:
+                cmd = "virsh autostart --disable {}".format(vm_name)
+                result = subprocess.call(cmd, shell=True)
+                if result == 0:
+                    print("VM '{}' auto start disabled successfully.\n".format(vm_name))
+                else:
+                    print("Failed to disable auto start for VM '{}'.\n".format(vm_name))
+        except Exception as e:
+            print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, e))
+
     # clear commands
     def clear_cli_callback(self, key, param):
         if len(param) <= 2:
@@ -1356,6 +1453,225 @@ class AellaCli(cmd.Cmd, object):
 
         except Exception as e:
             print(e)
+
+    def monitor_vm_callback(self, key, param):
+        """Monitor VM resource usage or launch htop for a specific VM"""
+        # Show help if explicitly requested
+        if param and len(param) == 1 and (param[0] == '?' or param[0] == 'help'):
+            print('\nhtop <VM Name>  Monitor specific VM with htop')
+            print('                List all running VMs with resource usage\n')
+            return
+        
+        # Handle 'monitor vm htop <vm_name>'
+        if param and len(param) >= 1 and param[0] == 'htop':
+            if len(param) < 2:
+                print('\n<VM Name>  Specify VM name to monitor with htop\n')
+                return
+            vm_name = param[1].rstrip('?')
+            if param[1].endswith('?') or vm_name == '?':
+                print('\n<VM Name>  Specify VM name to monitor with htop\n')
+                return
+            
+            # Find qemu PID for the VM
+            pid_file = '/run/libvirt/qemu/{}.pid'.format(vm_name)
+            if not os.path.exists(pid_file):
+                print('VM "{}" not found or not running (PID file does not exist)\n'.format(vm_name))
+                return
+            
+            try:
+                with open(pid_file, 'r') as f:
+                    pid = f.read().strip()
+                # Execute htop in current TTY
+                subprocess.call(['sudo', 'htop', '-p', pid])
+            except Exception as e:
+                print('Failed to launch htop for VM "{}": {}\n'.format(vm_name, e))
+            return
+        
+        # Handle 'monitor vm' - list VMs with CPU/memory usage
+        try:
+            # Get running VMs
+            cmd = "virsh list --name"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                print('Failed to get VM list\n')
+                return
+            
+            vm_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
+            
+            if not vm_list:
+                print('No running VMs found\n')
+                return
+            
+            # Print header
+            print('\n{:<15} {:<8} {:<8} {:<10}'.format('VM', 'PID', 'CPU%', 'RSS(MB)'))
+            print('-' * 45)
+            
+            # For each VM, get PID and resource usage
+            for vm in vm_list:
+                pid_file = '/run/libvirt/qemu/{}.pid'.format(vm)
+                if not os.path.exists(pid_file):
+                    continue  # Skip silently if PID file doesn't exist
+                
+                try:
+                    with open(pid_file, 'r') as f:
+                        pid = f.read().strip()
+                    
+                    # Get CPU and RSS using ps
+                    cmd = "ps -p {} -o %cpu,rss --no-headers".format(pid)
+                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out, err = proc.communicate()
+                    
+                    if proc.returncode == 0 and out:
+                        parts = out.decode('utf-8', errors='ignore').strip().split()
+                        if len(parts) >= 2:
+                            cpu_percent = parts[0].strip()
+                            rss_kb = int(parts[1].strip())
+                            rss_mb = rss_kb / 1024.0
+                            print('{:<15} {:<8} {:<8} {:<10.1f}'.format(vm, pid, cpu_percent, rss_mb))
+                except Exception:
+                    # Skip VM if we can't get its info
+                    continue
+            
+            print('')
+        except Exception as e:
+            print('Failed to monitor VMs: {}\n'.format(e))
+
+    def health_check_callback(self, key, param):
+        """Check system health status"""
+        try:
+            # 1. CPU load
+            try:
+                with open('/proc/loadavg', 'r') as f:
+                    loadavg = f.read().strip().split()
+                    load_1min = float(loadavg[0])
+                
+                # Get CPU core count
+                cmd = "nproc"
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, _ = proc.communicate()
+                cpu_cores = int(out.decode('utf-8', errors='ignore').strip()) if out else 1
+                
+                if load_1min < cpu_cores:
+                    print('[OK]   load: {:.1f} (cores={})'.format(load_1min, cpu_cores))
+                else:
+                    print('[WARN] load: {:.1f} (cores={})'.format(load_1min, cpu_cores))
+            except Exception as e:
+                print('[ERR]  load: failed to check ({})'.format(e))
+            
+            # 2. Memory availability
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                    mem_total = 0
+                    mem_available = 0
+                    for line in meminfo.split('\n'):
+                        if line.startswith('MemTotal:'):
+                            mem_total = int(line.split()[1])
+                        elif line.startswith('MemAvailable:'):
+                            mem_available = int(line.split()[1])
+                
+                if mem_total > 0:
+                    mem_percent = (mem_available / mem_total) * 100
+                    if mem_percent > 20:
+                        print('[OK]   mem: {:.0f}% available'.format(mem_percent))
+                    else:
+                        print('[WARN] mem: {:.0f}% available'.format(mem_percent))
+                else:
+                    print('[ERR]  mem: failed to get memory info')
+            except Exception as e:
+                print('[ERR]  mem: failed to check ({})'.format(e))
+            
+            # 3. Swap usage
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                    swap_total = 0
+                    swap_free = 0
+                    for line in meminfo.split('\n'):
+                        if line.startswith('SwapTotal:'):
+                            swap_total = int(line.split()[1])
+                        elif line.startswith('SwapFree:'):
+                            swap_free = int(line.split()[1])
+                
+                if swap_total > 0:
+                    swap_used_kb = swap_total - swap_free
+                    swap_used_gb = swap_used_kb / (1024.0 * 1024.0)
+                    if swap_used_kb > 0:
+                        print('[WARN] swap: {:.1f}G used'.format(swap_used_gb))
+                    else:
+                        print('[OK]   swap: not in use')
+                else:
+                    print('[OK]   swap: not configured')
+            except Exception as e:
+                print('[ERR]  swap: failed to check ({})'.format(e))
+            
+            # 4. Root filesystem usage
+            try:
+                cmd = "df -h / | tail -1"
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, _ = proc.communicate()
+                if out:
+                    parts = out.decode('utf-8', errors='ignore').strip().split()
+                    if len(parts) >= 5:
+                        usage_str = parts[4].rstrip('%')
+                        usage = int(usage_str)
+                        if usage < 80:
+                            print('[OK]   /: {}% used'.format(usage))
+                        else:
+                            print('[WARN] /: {}% used'.format(usage))
+            except Exception as e:
+                print('[ERR]  /: failed to check ({})'.format(e))
+            
+            # 5. /stellar filesystem usage (only if mount exists)
+            try:
+                if os.path.exists('/stellar'):
+                    cmd = "df -h /stellar 2>/dev/null | tail -1"
+                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out, _ = proc.communicate()
+                    if out and out.strip():
+                        parts = out.decode('utf-8', errors='ignore').strip().split()
+                        if len(parts) >= 5:
+                            usage_str = parts[4].rstrip('%')
+                            usage = int(usage_str)
+                            if usage < 80:
+                                print('[OK]   /stellar: {}% used'.format(usage))
+                            else:
+                                print('[WARN] /stellar: {}% used'.format(usage))
+            except Exception as e:
+                pass  # Silently skip if /stellar doesn't exist or can't be checked
+            
+            # 6. libvirt service status
+            try:
+                # Try libvirtd first (older systems)
+                cmd = "systemctl is-active libvirtd 2>/dev/null"
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, _ = proc.communicate()
+                if proc.returncode == 0 and out:
+                    status = out.decode('utf-8', errors='ignore').strip()
+                    if status == 'active':
+                        print('[OK]   libvirt: active')
+                    else:
+                        print('[WARN] libvirt: {}'.format(status))
+                else:
+                    # Try virtqemud (newer systems)
+                    cmd = "systemctl is-active virtqemud 2>/dev/null"
+                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out, _ = proc.communicate()
+                    if proc.returncode == 0 and out:
+                        status = out.decode('utf-8', errors='ignore').strip()
+                        if status == 'active':
+                            print('[OK]   libvirt: active')
+                        else:
+                            print('[WARN] libvirt: {}'.format(status))
+                    else:
+                        print('[WARN] libvirt: service not found')
+            except Exception as e:
+                print('[ERR]  libvirt: failed to check ({})'.format(e))
+            
+            print('')
+        except Exception as e:
+            print('Failed to check system health: {}\n'.format(e))
 
     @staticmethod
     def show_patch_history_callback(key, params):
@@ -2028,6 +2344,38 @@ class AellaCli(cmd.Cmd, object):
             return self.complete_set_interface(text, line, begidx, endidx)
         else:
             completions = [f for f in self.set_command_help.keys() if f.startswith(text)]
+        return completions
+
+    def complete_monitor(self, text, line, begidx, endidx):
+        """Tab completion for monitor command"""
+        if not text:
+            completions = self.monitor_command_help.keys()
+        elif line.startswith('monitor vm'):
+            # Handle 'monitor vm htop <vm>'
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == 'htop':
+                # Complete VM names for htop
+                vm_list = self.get_vm_list()
+                if not text:
+                    return vm_list
+                return [vm for vm in vm_list if vm.startswith(text)]
+            elif len(parts) == 2:
+                # Complete subcommands after 'monitor vm'
+                if not text:
+                    return ['htop']
+                return ['htop'] if 'htop'.startswith(text) else []
+            else:
+                completions = [f for f in self.monitor_command_help.keys() if f.startswith(text)]
+        else:
+            completions = [f for f in self.monitor_command_help.keys() if f.startswith(text)]
+        return completions
+
+    def complete_health(self, text, line, begidx, endidx):
+        """Tab completion for health command"""
+        if not text:
+            completions = self.health_command_help.keys()
+        else:
+            completions = [f for f in self.health_command_help.keys() if f.startswith(text)]
         return completions
 
     # Check to see whether service port opened or not
