@@ -1,0 +1,9 @@
+six==1.10.0
+pyfiglet==0.8.post1
+termcolor==1.1.0
+click==7.1.2
+filelock==3.0.12
+toml==0.10.2
+
+[:(python_version < '3.6')]
+python2-secrets==1.0.5
