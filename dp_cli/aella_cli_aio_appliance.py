@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Copyright (c) 2021, Stellar Cyber Inc.
+Copyright (c) 2026, Stellar Cyber Inc.
 
 Appliance Command Line Interface (CLI)
 
-Date: 2021-01-21
+Date: 2026-01-01
 
 """
 
@@ -27,13 +27,9 @@ import signal
 import subprocess
 import struct
 import hashlib
-import pyfiglet
-import termcolor
 import logging
 import logging.handlers
-import functools
 
-from .utils import disk_encrypt
 from .utils.log import LOG, log_cmd
 from .utils.constant import ALL_TIMEZONES
 
@@ -78,23 +74,21 @@ class AellaCli(cmd.Cmd, object):
                 readline.set_completer_delims(' \t\n')
             except Exception:
                 pass
-        self.deu = disk_encrypt.DiskEncryptUtil(logger=LOG)
 
         # Root command help
         self.root_command_help = {
             'console': 'Jump to mds2, dl-master, da-master(aka dr-master), or mds console',
             'show': 'Display Component Information',
-            'set': 'Configure Component Parameters ',
+            'set': 'Configure Component Parameters',
             'unset': 'Unset Configuration',
-            'shutdown': 'Shutdown System Or Service',
-            'start': 'Start System Or Service',
-            'restart': 'Restart System Or Service',
-            'disk_encrypt': 'Execute operations of disk encryption',
+            'shutdown': 'Shutdown System or Service',
+            'start': 'Start System or Service',
+            'restart': 'Restart System or Service',
             'clear': 'Clear History',
             'monitor': 'Monitor VM resources and system health',
             'health': 'Check system health status',
             'quit': 'Exit CLI',
-            'help': 'Display Help Information  ',
+            'help': 'Display Help Information',
         }
 
         # Show command help
@@ -195,7 +189,7 @@ class AellaCli(cmd.Cmd, object):
         self.console_command_callback = {}
         vm_list = self.get_vm_list()
         for vm in vm_list:
-            self.console_command_help[vm] = 'Goto {} console'.format(vm)
+            self.console_command_help[vm] = 'Go to {} console'.format(vm)
             self.console_command_callback[vm] = self._create_vm_console_callback(vm)
 
         self.clear_command_help = {
@@ -229,33 +223,6 @@ class AellaCli(cmd.Cmd, object):
             'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip', 'dig'
         ]
         self.shell_pass = '0238b57cd42b4aa6b85991ea28702133'
-
-        # Disk Encryption
-        self.disk_encrypt_command_help = {
-            'enable': 'Enable disk encryption, sets the initial passphrase and restart vm.',
-            'disable': 'Disable disk encryption and restart dl-master/aio vm.',
-            'open': 'Open encrypte  d disk',
-            'close': 'Close encrypted disk',
-            'add_key': 'Add a new passphrase.',
-            'remove_key': 'Removes the supplied passphrase.',
-            'change_key': 'Changes an existing passphrase.',
-            'backup_header': 'Stores a binary backup of the LUKS header and keyslot area.',
-            'restore_header': 'Restores a binary backup of the LUKS header and keyslot area from the specified file.',
-            'info': 'Dump the header information of device',
-        }
-
-        self.disk_encrypt_command_callback = {
-            'enable': self._create_disk_encrypt_callback(self._on_disk_encrypt_enable_callback),
-            'disable': self._create_disk_encrypt_callback(self._on_disk_encrypt_disable_callback),
-            'open': self._create_disk_encrypt_callback(self._on_disk_encrypt_open_callback),
-            'close': self._create_disk_encrypt_callback(self._on_disk_encrypt_close_callback),
-            'add_key': self._create_disk_encrypt_callback(self._on_disk_encrypt_add_key_callback),
-            'remove_key': self._create_disk_encrypt_callback(self._on_disk_encrypt_remove_key_callback),
-            'change_key': self._create_disk_encrypt_callback(self._on_disk_encrypt_change_key_callback),
-            'backup_header': self._create_disk_encrypt_callback(self._on_disk_encrypt_backup_header_callback),
-            'restore_header': self._create_disk_encrypt_callback(self._on_disk_encrypt_restore_header_callback),
-            'info': self._create_disk_encrypt_callback(self._on_disk_encrypt_info_callback),
-        }
 
     # Main loop
     def cmdloop(self, intro=None):
@@ -407,11 +374,6 @@ class AellaCli(cmd.Cmd, object):
     def _create_vm_start_callback(self, vm_name):
         """Create a callback function for starting a VM"""
         def callback(key, param):
-            # Special handling for dl-master
-            if vm_name == 'dl-master':
-                if not self.deu.ensure_open_encrypted_disk():
-                    self.deu.print_log("Failed to prepare stellar data disk", level=logging.ERROR)
-                    return
             self.shell_cmd_exec('virsh start {}'.format(vm_name))
         return callback
 
@@ -424,16 +386,7 @@ class AellaCli(cmd.Cmd, object):
     def _create_vm_shutdown_callback(self, vm_name):
         """Create a callback function for shutting down a VM"""
         def callback(key, param):
-            # Special handling for dl-master
-            if vm_name == 'dl-master':
-                for vm in self.deu.get_vm_names(services=("dl-master",)):
-                    if not self.deu.shutdown_vm(vm, destroy=False):
-                        print("\nWARNING: Failed to shutdown dl-master gracefully and will kill dl-master.")
-                        if not self.deu.double_confirm() or not self.deu.destroy_vm(vm):
-                            return
-                self.deu.ensure_close_encrypted_disk()
-            else:
-                self.shell_cmd_exec('virsh shutdown {}'.format(vm_name))
+            self.shell_cmd_exec('virsh shutdown {}'.format(vm_name))
         return callback
 
     def _create_vm_console_callback(self, vm_name):
@@ -607,7 +560,7 @@ class AellaCli(cmd.Cmd, object):
             output += "\n".join(tokens)
             output += "\n"
         except Exception as e:
-            print("Failed to get dns servers: ".format(e))
+            print("Failed to get DNS servers: {}".format(e))
         print(output)
 
 
@@ -775,7 +728,7 @@ class AellaCli(cmd.Cmd, object):
         try:
             conf_path = '/etc/network/interfaces'
             if not os.path.exists(conf_path):
-                print('Cannot find {}'.format(conf_path))
+                print('Could not find {}'.format(conf_path))
                 return
             with open(conf_path, 'r') as f:
                 lines = f.readlines()
@@ -825,7 +778,7 @@ class AellaCli(cmd.Cmd, object):
                     m = re.match("default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\w+)", res[0].decode('utf-8').rstrip())
                     return m
             except Exception as e:
-                print("Failed to get gateway: ".format(e))
+                print("Failed to get gateway: {}".format(e))
 
         # find mgt network default gateway
         cmd = "ip route show table 1 | grep default"
@@ -841,7 +794,7 @@ class AellaCli(cmd.Cmd, object):
         if result:
             print('Data network gateway {} via {} interface\n'.format(result.group(1), result.group(2)))
         else:
-            print('Data network gateway is NOT configured or applied !!!\n')
+            print('Data network gateway is not configured or applied\n')
 
     def show_service(self, key, param):
         if key:
@@ -885,12 +838,12 @@ class AellaCli(cmd.Cmd, object):
             elif len(param) <= 2:
                 #if len(param) == 1 and (param[0].endswith('mgt?') or param[0].endswith('data1g?') or param[0].endswith('data10g?')):
                 if len(param) == 1 and re.match('mgt[?]|data1[0]?g[?]|cltr0[?]', param[0]):
-                     print('\nHit [Enter]\n')
+                     print('\nPress [Enter]\n')
                      return
                 #elif len(param) == 1 and (param[0] == '?' or not (param[0] == 'mgt' or param[0] == 'data1g' or param[0] == 'data10g')):
                 elif len(param) == 1 and (param[0] == '?' or not re.match('mgt|data1[0]?g|cltr0', param[0])):
                     print('\n<Interface Name>  Specify a supported interface name (mgt, data1g, data10g, cltr0)')
-                    print('Hit [Enter]\n')
+                    print('Press [Enter]\n')
                     return
                 elif len(param) == 1 and not self.is_device_exist(param[0]):
                     return
@@ -909,7 +862,7 @@ class AellaCli(cmd.Cmd, object):
                     self.shell_cmd_exec('ethtool -i {} | grep -E "^driver|^version|^firmware-version|^bus-info"'.format(param[0]))
                 #elif len(param) == 2 and (param[0] == 'mgt' or param[0] == 'data1g' or param[0] == 'data10g') and param[1] == '?' :
                 elif len(param) == 2 and re.match('mgt|data1[0]?g|cltr0', param[0]) and param[1] == '?' :
-                     print('\nHit [Enter]\n')
+                     print('\nPress [Enter]\n')
                      return
 
     def show_route_callback(self, key, param):
@@ -991,7 +944,7 @@ class AellaCli(cmd.Cmd, object):
             elif (len(param) == 1 and re.match('history[?]', param[0])) or \
                 (len(param) == 2 and re.match('^[?]$', param[1])):
                 print('\nlast <number>    Show CLI history for last N (1..5000)')
-                print('Hit [Enter]\n')
+                print('Press [Enter]\n')
                 return
             elif len(param) == 2 and re.match('history', param[0]) and not re.match('last', param[1]):
                 print('Invalid option: Available option is "last"')
@@ -1002,7 +955,7 @@ class AellaCli(cmd.Cmd, object):
                 print('\nlast <number>    Show CLI history for last N (1..5000)\n')
                 return
             elif len(param) == 3 and re.match('history', param[0]) and re.match('last', param[1]) and re.match('^\d+[?]$', param[2]):
-                print('Hit [Enter]\n')
+                print('Press [Enter]\n')
                 return
             elif len(param) == 3 and re.match('history', param[0]) and re.match('last', param[1]):
                 try:
@@ -1015,7 +968,7 @@ class AellaCli(cmd.Cmd, object):
                     print("Invalid number: Enter a valid number from 1 to 5000\n")
                     return
             elif len(param) == 4 and re.match('history', param[0]) and re.match('last', param[1]) and re.match('^[?]$', param[3]):
-                print('Hit [Enter]\n')
+                print('Press [Enter]\n')
                 return
 
         try:
@@ -1047,7 +1000,7 @@ class AellaCli(cmd.Cmd, object):
 
     def set_tz_callback(self, key, param):
         if len(param) == 0 or param[0] not in ALL_TIMEZONES:
-            print("Unknow timezone. eg: 'America/Los_Angeles'")
+            print("Unknown timezone. e.g.: 'America/Los_Angeles'")
             return
         else:
             cmd = "sudo timedatectl set-timezone '{}'".format(param[0])
@@ -1103,7 +1056,7 @@ class AellaCli(cmd.Cmd, object):
 
         if ret == 0:
             subprocess.call(["sudo", "systemctl", "restart", "ntpsec"])
-            return "Succeed to set ntp {0}\n".format(param[0])
+            return "Successfully set ntp {0}\n".format(param[0])
         else:
             print("Failed to set ntp {0}\n".format(param[0]))
             return "Failed to set ntp {0}\n".format(param[0])
@@ -1172,7 +1125,7 @@ class AellaCli(cmd.Cmd, object):
                 return
             elif (len(param) == 2 and re.match('data1[0]?g', param[0]) and re.match('ip[?]|gateway[?]|restart[?]', param[1])) or \
                 (len(param) == 3 and re.match('data1[0]?g', param[0]) and re.match('ip|gateway|restart', param[1]) and param[2].endswith('?')):
-                print("\nHit [Enter]\n")
+                print("\nPress [Enter]\n")
                 return
      
         interface = param[0]
@@ -1197,22 +1150,22 @@ class AellaCli(cmd.Cmd, object):
                 p = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
                 res = p.communicate() 
                 if not res[0]:
-                    print('Cannot find the default gateway on the interface {}\n'.format(interface))
+                    print('Could not find the default gateway on the interface {}\n'.format(interface))
                     return 
                 m = re.match('default\s+via\s+\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+dev\s+(\w+)', res[0].decode('utf-8'))
                 if not m.group(1) == interface:
-                    print('Cannot delete the default gateway due to interface mismatch\n')
+                    print('Could not delete the default gateway due to interface mismatch\n')
                     return
                 cmd_del = 'ip route del {} table 2'.format(m.group(0).rstrip())
                 p = subprocess.Popen(cmd_del, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
                 res = p.communicate()
                 if res[1]:
-                    print('Cannot delete the default gateway on the interface {} or the default gateway was deleted already\n'.format(interface))
+                    print('Could not delete the default gateway on the interface {} or the default gateway was already deleted\n'.format(interface))
                     print(res[1].decode('utf-8').rstrip())
                 print('Successfully deleted the default gateway: {}\n'.format(m.group(0)))
 
             except Exception as e:
-                print('Cannot delete the default gateway\n')
+                print('Could not delete the default gateway\n')
 
         elif option == 'restart':
              print('Restarting network interface. You need to use new IP address to reconnect...\n')
@@ -1334,7 +1287,7 @@ class AellaCli(cmd.Cmd, object):
                 print("Applying updates...")
                 cmd = "sudo apt -qq update && sudo apt -qqy install {0} && sudo apt clean".format(patches)
                 self.shell_cmd_exec(cmd)
-                print("Successfully apply updates")
+                print("Successfully applied updates")
         except Exception as e:
             print("Failed to apply updates {}".format(e))
 
@@ -1420,12 +1373,12 @@ class AellaCli(cmd.Cmd, object):
                 return
             elif (len(param) == 1 and not re.match('history', param[0])) or \
                 (len(param) == 2 and not re.match('history', param[0])):
-                print('Invalid option: Available option si "history"')
+                print('Invalid option: Available option is "history"')
                 print('\nhistory    Clear CLI history\n')
                 return
             elif (len(param) == 1 and re.match('history[?]', param[0])) or \
                 (len(param) == 2 and re.match('history', param[0]) and re.match('^[?]$', param[1])):
-                print('\nHit [Enter]\n')
+                print('\nPress [Enter]\n')
                 return
         try:
             current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1435,7 +1388,7 @@ class AellaCli(cmd.Cmd, object):
             cmd = 'cp -a {0} {1}'.format(cli_log_file, cli_log_backup)
             p = subprocess.call(cmd, shell=True)
             if not p == 0:
-                print('Failed copy: {}'.format(cmd))
+                print('Failed to copy: {}'.format(cmd))
             log_str = '{},000|INFO|0|log|Run command: ### clear cli history ###\n'.format(current_time)
             with open(cli_log_file, 'w') as f:
                 f.write(log_str) 
@@ -1687,13 +1640,13 @@ class AellaCli(cmd.Cmd, object):
                 patch_history = {}
             if patch:
                 if patch not in patch_history:
-                    print("There is no history associated with specified patch")
+                    print("There is no history associated with the specified patch")
                     return
                 state = patch_history[patch].get("state", "Unknown")
                 log_file = "{}/{}.log".format(PATCH_LOG_DIR,
                                               patch)
                 if not os.path.isfile(log_file):
-                    print("There is no history associated with specified patch")
+                    print("There is no history associated with the specified patch")
                     return
                 try:
                     rf = open(log_file, 'r')
@@ -1917,7 +1870,7 @@ class AellaCli(cmd.Cmd, object):
                     # Matching the address line
                     elif re.match("\s*address\s+(.*)", line):
                         if network_mode == "dhcp":
-                            print("DHCP does not need explicit address")
+                            print("DHCP does not require an explicit address")
                         elif new_address:
                             contents.append("address {0}".format(new_address))
                             iface_configured = True
@@ -1926,7 +1879,7 @@ class AellaCli(cmd.Cmd, object):
                     # Matching the netmask line
                     elif re.match("\s*netmask\s+(.*)", line):
                         if network_mode == "dhcp":
-                            print("DHCP does not need explicit address")
+                            print("DHCP does not require an explicit address")
                         elif new_netmask:
                             contents.append("netmask {0}".format(new_netmask))
                             netmask_configured = True
@@ -1936,7 +1889,7 @@ class AellaCli(cmd.Cmd, object):
                     # Matching the gateway line
                     elif re.match("\s*gateway\s+.*", line):
                         if network_mode == "dhcp":
-                            print("DHCP does not need explicit address")
+                            print("DHCP does not require an explicit address")
                         elif new_gateway:
                             contents.append("gateway {0}".format(new_gateway))
                             iface_configured = True
@@ -2091,7 +2044,7 @@ class AellaCli(cmd.Cmd, object):
 
         elif is_gateway_change:
             if not current_address or not current_mask: 
-                print('Please configure IP address and netmask prior to configuring "{}" interface gateway'.format(interface))
+                print('Please configure IP address and netmask before configuring "{}" interface gateway'.format(interface))
                 print('set interface {} ip <IP Address/Netmask>\n'.format(interface))
                 return
             self.update_dp_mgt_data(new_gateway, interface) 
@@ -2192,7 +2145,7 @@ class AellaCli(cmd.Cmd, object):
             elif len(param) == 2 and not re.match('ip|gateway|dns|restart', param[1]):
                 print('Invalid option: Available options are "ip", "gateway", "dns" and "restart"')
                 print('\nip <IP Address/Netmask>   Specify interface IP address and netmask')
-                print('dns <IP Address> [...]    Specify DNS server IP address or addrsses separated by space')
+                print('dns <IP Address> [...]    Specify DNS server IP address or addresses separated by space')
                 print('gateway <IP Address>      Specify default gateway IP address')
                 print('restart                   Restart network interface\n')
                 return
@@ -2206,15 +2159,15 @@ class AellaCli(cmd.Cmd, object):
                 return
             elif (len(param) == 2 and param[1].endswith('dns?')) or \
                 (len(param) == 3 and param[1] == 'dns' and param[2].endswith('?')):
-                print('\n<IP Address> [...]    Specify DNS server IP address or addrsses separated by space\n')
+                print('\n<IP Address> [...]    Specify DNS server IP address or addresses separated by space\n')
                 return
             elif (len(param) == 2 and param[1].endswith('restart?')) or \
                 (len(param) == 3 and param[1] == 'restart' and param[2].endswith('?')):
-                print('\nHit [Enter]\n')
+                print('\nPress [Enter]\n')
                 return
             elif (len(param) == 3 and param[1] == 'ip' and self.valid_ipv4_address(param[2].rstrip('?')) and param[2].endswith('?')) or \
                 (len(param) == 4 and param[1] == 'ip' and self.valid_ipv4_address(param[2]) and param[3] == '?'):
-                print('\nHit [Enter]\n')
+                print('\nPress [Enter]\n')
                 return
             elif (len(param) == 3 and param[1] == 'gateway' and self.valid_ipv4_address(param[2].rstrip('?')) and param[2].endswith('?')) or \
                 (len(param) == 4 and param[1] == 'gateway' and self.valid_ipv4_address(param[2]) and param[3] == '?'):
@@ -2223,7 +2176,7 @@ class AellaCli(cmd.Cmd, object):
                     print('Invalid gateway IP address format:')
                     print('\n<IP Address>      Specify default gateway IP address\n')
                     return
-                print('\nHit [Enter]\n') 
+                print('\nPress [Enter]\n') 
                 return
 
         interface = param[0]
@@ -2276,7 +2229,7 @@ class AellaCli(cmd.Cmd, object):
                 if self.valid_ipv4_address(dns_address[i]):
                     exist_valid_dns_ip = 1
                 elif dns_address[i] == '?' and exist_valid_dns_ip == 1:
-                    print('\nHit [Enter]\n')
+                    print('\nPress [Enter]\n')
                     return
                 elif not self.valid_ipv4_address(dns_address[i]):
                     print('Invalid DNS server IP address format: {0}'.format(dns_address[i]))
@@ -2420,363 +2373,6 @@ class AellaCli(cmd.Cmd, object):
         if status == 0:
             return True
         return False
-
-    # Disk encrypt command
-    @log_cmd
-    def do_disk_encrypt(self, line):
-        """ Disk encrypt command """
-        return self._on_nested_command(line, self.disk_encrypt_command_help, self.disk_encrypt_command_callback)
-
-    @staticmethod
-    def _print_caution_banner(text='caution!', font='starwars'):
-        termcolor.cprint(pyfiglet.figlet_format(text, font=font), 'red', attrs=['bold'])
-
-    def _print_data_loss_warning(self, message="\nWARNING: This will cause data loss."):
-        self._print_caution_banner()
-        print(message)
-
-    def _create_disk_encrypt_callback(self, callback):
-        @functools.wraps(callback)
-        def wrapper(*args, **kwargs):
-            self.deu.with_lock(callback, *args, **kwargs)
-        return wrapper
-
-    def _on_disk_encrypt_enable_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        source_device = "/dev/vg_dl/lv_dl"
-        proc = subprocess.Popen("sudo test -L {}".format(source_device), shell=True)
-        proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log('Failed to find device {}'.format(source_device), level=logging.ERROR)
-            return
-
-        self._print_data_loss_warning(
-            "\nWARNING: This will cause data loss. When you enable disk encryption, "
-            "we reformat the file system and all data is lost. If you want to keep existing data, "
-            "please make a backup and restore when encryption finishes. And this only ensures that the related data "
-            "locating in the appliance is encrypted at rest. The encryption of backups outside the appliance "
-            "depends on the configuration of external storage itself.")
-        if not self.deu.double_confirm():
-            return
-
-        if not self.deu.ensure_mod_dm_crypt():
-            return
-
-        stopped_vm_names = set()
-        for vm in self.deu.get_vm_names():
-            if not self.deu.shutdown_vm(vm):
-                for stopped_vm in stopped_vm_names:
-                    self.deu.start_vm(stopped_vm)
-                return
-
-        # open encrypted disk
-        # use same name. because we don't change vm disk setting
-        target_name = "encrypted-vg_dl-lv_dl"
-
-        # remove opened disk first
-        original_device = '/dev/mapper/{}'.format(target_name)
-        proc = subprocess.Popen("sudo test -L {}".format(original_device), shell=True)
-        proc.communicate()
-        if proc.returncode == 0:
-            self.deu.print_log(
-                "\nWARNING: Found that device {} is still in use and "
-                "re-enable will cause data loss.".format(source_device))
-            if not self.deu.double_confirm():
-                return
-            if not self.deu.close_encrypted_disk(target_name):
-                return
-
-        delay = 3
-        print("\nWARNING: This will cause data loss and reboot appliance in {} minutes. "
-              "During the bootstrap of appliance, you can enter passphrase to open encrypted disk "
-              "if you have console access. Otherwise, the DL VM will not start. "
-              "You need manually start DL VM using appliance CLI:\n"
-              "1. run `disk_encrypt open` to open encrypt disk\n"
-              "2. run `start dl-master` to start DL VM\n"
-              "3. run `show service` to check the status of VM\n".format(delay))
-        if not self.deu.double_confirm():
-            return
-
-        passwd = self.deu.generate_passphrase()
-        print("Here is your passphrase for disk encryption. You will not be able to view this passphrase again, "
-              "so be sure to record it securely.\n{}\n".format(passwd))
-        if not self.deu.setup_disk_encryption(source_device, passwd):
-            return
-
-        # avoid notification for all users
-        self.deu.disable_systemd_services()
-
-        if not self.deu.open_encrypted_disk(source_device, target_name):
-            return
-        if not self.deu.format_disk(target_name):
-            return
-
-        if not self.deu.enable_encrypted_symlink(target_name):
-            return
-        if not self.deu.update_crypttab(source_device, target_name):
-            return
-        if not self.deu.update_header_backups(source_device, self.deu.get_digest(passwd)):
-            return
-
-        self.deu.print_log('The disk encryption of {} is enabled.'.format(source_device))
-
-        proc = subprocess.Popen("sudo shutdown -r +{}".format(delay), stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log('Failed to schedule the reboot of appliance', level=logging.ERROR)
-            return
-
-        message = 'Shutdown scheduled after {} minutes.'.format(delay)
-        if err:
-            parts = err.decode("utf-8").split(",")
-            if len(parts) >= 1:
-                message = parts[0]
-        self.deu.print_log(message)
-
-    def _on_disk_encrypt_disable_callback(self, key, param):
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        self._print_data_loss_warning(
-            "\nWARNING: This will cause data loss. When you disable disk encryption, "
-            "we reformat the file system and all data is lost. If you want to keep existing data, "
-            "please make a backup and restore when encryption is disabled.")
-        if not self.deu.double_confirm():
-            return False
-
-        if not self.deu.validate_disk_encryption(source_device):
-            return
-
-        stopped_vm_names = set()
-        for vm in self.deu.get_vm_names():
-            if not self.deu.shutdown_vm(vm):
-                for stopped_vm in stopped_vm_names:
-                    self.deu.start_vm(stopped_vm)
-                return
-
-        # avoid notification for all users
-        self.deu.disable_systemd_services()
-
-        # try closing disk anyway
-        self.deu.close_encrypted_disk(target_name, print_error=False)
-
-        # destroy header
-        proc = subprocess.Popen("sudo cryptsetup erase {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Failed to erase header: {}".format(err.decode("utf-8")), level=logging.ERROR)
-            return
-
-        new_target_name = "vg_dl-lv_dl"
-        if not self.deu.disable_encrypted_symlink(new_target_name):
-            return
-        # remove cryptsetup
-        if not self.deu.remove_crypttab(source_device, target_name):
-            return
-        # format plain disk
-        if not self.deu.format_disk(new_target_name):
-            return
-
-        for stopped_vm in self.deu.get_vm_names(running=False):
-            self.deu.start_vm(stopped_vm)
-
-        self.deu.print_log('The disk encrypt of {} is disabled.'.format(source_device))
-
-    def _on_disk_encrypt_open_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        running_vm_names = self.deu.get_vm_names()
-        if running_vm_names:
-            self.deu.print_log(
-                'Found running vm {} and please shut them down first.'.format(','.join(running_vm_names)))
-            return
-
-        if not self.deu.open_encrypted_disk(source_device, target_name):
-            return
-
-        target_name = "encrypted-vg_dl-lv_dl"
-        if not self.deu.enable_encrypted_symlink(target_name):
-            return
-        self.deu.print_log('The encrypted disk {} is open.'.format(source_device))
-
-    def _on_disk_encrypt_close_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        running_vm_names = self.deu.get_vm_names()
-        if running_vm_names:
-            self.deu.print_log(
-                'Found running vm {} and please shut them down first.'.format(','.join(running_vm_names)))
-            return
-
-        if not self.deu.close_encrypted_disk(target_name):
-            return
-        self.deu.print_log('The encrypted disk {} is closed.'.format(source_device))
-
-    def _on_disk_encrypt_add_key_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        if self.deu.get_available_key_slots(source_device) <= 0:
-            self.deu.print_log("Failed to add key: no available key slots.")
-            return
-
-        passwd = self.deu.generate_passphrase()
-        print("Here is the recommended new passphrase. You will not be able to view this passphrase again, "
-              "so be sure to record it securely.\n{}\n".format(passwd))
-        proc = subprocess.Popen("sudo cryptsetup luksAddKey {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Failed to add key: {}".format(err.decode("utf-8")), level=logging.ERROR)
-            return
-
-        self.deu.update_header_backups(source_device, self.deu.get_digest(passwd))
-        self.deu.print_log('The new passphrase is added.')
-
-    def _on_disk_encrypt_remove_key_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        if self.deu.is_last_key(source_device):
-            self.deu.print_log("Failed to remove key: can't remove last passphrase.")
-            return
-
-        self._print_caution_banner()
-        proc = subprocess.Popen("sudo cryptsetup luksRemoveKey {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Failed to remove key: {}".format(err.decode("utf-8")), level=logging.ERROR)
-            return
-
-        self.deu.update_header_backups(source_device, 'remove')
-        self.deu.print_log('The passphrase is removed.')
-
-    def _on_disk_encrypt_change_key_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        passwd = self.deu.generate_passphrase()
-        print("Here is the recommended new passphrase. You will not be able to view this passphrase again, "
-              "so be sure to record it securely.\n{}\n".format(passwd))
-        proc = subprocess.Popen("sudo cryptsetup luksAddKey {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log('Failed to create new passphrase: {}'.format(err.decode("utf-8")), level=logging.ERROR)
-            return
-
-        proc = subprocess.Popen("sudo cryptsetup luksRemoveKey {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log('Failed to remove old passphrase: {}'.format(err.decode("utf-8")), level=logging.ERROR)
-            return
-
-        self.deu.update_header_backups(source_device, self.deu.get_digest(passwd))
-        self.deu.print_log('The passphrase is changed.')
-
-    def _on_disk_encrypt_backup_header_callback(self, key, param):
-        if len(param) != 1:
-            print('Please specify /path/to/backup/file.')
-            return
-        if param[0].endswith("?"):
-            print('\n<Backup File>         Specify the absolute path of backup file\n')
-            return
-        backup_file = param[0]
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        self._print_caution_banner()
-        print("\nWARNING: This backup file and a passphrase valid at the time of backup allows decryption of the {} "
-              "data area, even if the passphrase was later changed or removed from the device. Also note that "
-              "with header backup you lose the ability to securely wipe the device by just overwriting the "
-              "header.".format(source_device))
-        if not self.deu.double_confirm():
-            return
-
-        if not self.deu.create_header_backup(source_device, backup_file):
-            return
-        self.deu.print_log('The header of {} is copied to {}.'.format(source_device, backup_file))
-
-    def _on_disk_encrypt_restore_header_callback(self, key, param):
-        if len(param) != 1:
-            print('Please specify /path/to/backup/file.')
-            return
-        if param[0].endswith("?"):
-            print('\n<Backup File>         Specify the absolute path of backup file\n')
-            return
-
-        backup_file = param[0]
-        proc = subprocess.Popen("sudo test {}".format(backup_file), shell=True)
-        proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Backup file {} doesn't exist.".format(backup_file))
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        self._print_caution_banner()
-        proc = subprocess.Popen("sudo cryptsetup luksHeaderRestore {} --header-backup-file {}".format(
-            source_device, backup_file), stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Failed to restore header: {}".format(err.decode("utf-8")), level=logging.ERROR)
-            return
-        self.deu.print_log('The header of {} is overwritten by {}.'.format(source_device, backup_file))
-
-    def _on_disk_encrypt_info_callback(self, key, param):
-        if len(param) >= 1:
-            return
-
-        target_name, source_device = self.deu.read_crypttab()
-        if not target_name:
-            self.deu.print_log('The disk encryption is not enabled.')
-            return
-
-        proc = subprocess.Popen("sudo cryptsetup luksDump {}".format(source_device),
-                                stderr=subprocess.PIPE, shell=True)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            self.deu.print_log("Failed to show info: {}".format(err.decode("utf-8")), level=logging.ERROR)
 
 
 def signal_handler(signal, frame):
