@@ -212,7 +212,7 @@ class AellaCli(cmd.Cmd, object):
 
         # Shell command
         self.shell_command = [
-            'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip', 'dig'
+            'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip', 'dig', 'htop', 'top'
         ]
         self.shell_pass = '0238b57cd42b4aa6b85991ea28702133'
 
@@ -1465,11 +1465,14 @@ class AellaCli(cmd.Cmd, object):
             print('\n' + '=' * 95)
             print('VM Resource Usage Monitor')
             print('=' * 95)
-            print('CPU%: Total CPU usage (sum across all cores, can exceed 100% on multi-core systems)')
-            print('      Example: 200% on 4-core system = 2 cores fully utilized (50% per core average)')
+            print('CPU%: CPU usage percentage (from top command, can exceed 100% for multi-threaded processes)')
+            print('      For multi-threaded processes, this is the sum of all thread CPU usage')
+            print('      Example: 200% = equivalent to 2 CPU cores fully utilized')
+            print('      Note: High CPU% may not reflect actual system load if threads are waiting')
             print('RSS:  Resident Set Size - actual physical memory used by the VM process (MB)')
             print('Mem%: Memory usage percentage (RSS / allocated memory)')
             print('      May exceed 100% in overcommit scenarios (RSS > allocated)')
+            print('      High Mem% is normal as memory is pre-allocated to VMs')
             print('Status: OK=Normal, WARN=High usage, CRIT=Critical')
             print('-' * 95)
             print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
@@ -1486,94 +1489,137 @@ class AellaCli(cmd.Cmd, object):
                     with open(pid_file, 'r') as f:
                         pid = f.read().strip()
                     
-                    # Get CPU, RSS, and threads using ps
-                    cmd = "ps -p {} -o %cpu,rss,nlwp --no-headers".format(pid)
+                    # Get CPU, RSS, and threads using top (more accurate for multi-threaded processes)
+                    # Use top -b -n 1 for batch mode, single iteration
+                    cmd = "top -b -n 1 -p {} 2>/dev/null | tail -1".format(pid)
                     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     out, err = proc.communicate()
                     
+                    cpu_percent = 0.0
+                    rss_kb = 0
+                    threads = 0
+                    
                     if proc.returncode == 0 and out:
-                        parts = out.decode('utf-8', errors='ignore').strip().split()
-                        if len(parts) >= 3:
-                            cpu_percent = float(parts[0].strip())
-                            rss_kb = int(parts[1].strip())
-                            threads = int(parts[2].strip())
-                            rss_mb = rss_kb / 1024.0
-                            rss_gb = rss_mb / 1024.0
-                            
-                            # Get VM memory allocation from virsh (use "Memory" field which is current allocation, not "Max memory")
+                        # Parse top output: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
+                        line = out.decode('utf-8', errors='ignore').strip()
+                        parts = line.split()
+                        if len(parts) >= 10:
                             try:
-                                # Try "Memory" first (current allocated memory)
-                                cmd = "virsh dominfo {} 2>/dev/null | grep -i '^Memory:' | awk '{{print $2}}'".format(vm)
+                                cpu_percent = float(parts[8])  # %CPU column
+                                # Get RSS from ps (top's RES is in KiB but we need exact value)
+                                cmd_ps = "ps -p {} -o rss,nlwp --no-headers".format(pid)
+                                proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                out_ps, _ = proc_ps.communicate()
+                                if proc_ps.returncode == 0 and out_ps:
+                                    ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
+                                    if len(ps_parts) >= 2:
+                                        rss_kb = int(ps_parts[0].strip())
+                                        threads = int(ps_parts[1].strip())
+                            except (ValueError, IndexError):
+                                # Fallback to ps if top parsing fails
+                                cmd_ps = "ps -p {} -o %cpu,rss,nlwp --no-headers".format(pid)
+                                proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                out_ps, _ = proc_ps.communicate()
+                                if proc_ps.returncode == 0 and out_ps:
+                                    ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
+                                    if len(ps_parts) >= 3:
+                                        cpu_percent = float(ps_parts[0].strip())
+                                        rss_kb = int(ps_parts[1].strip())
+                                        threads = int(ps_parts[2].strip())
+                    
+                    # If we still don't have data, try ps as fallback
+                    if rss_kb == 0:
+                        cmd_ps = "ps -p {} -o rss,nlwp --no-headers".format(pid)
+                        proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        out_ps, _ = proc_ps.communicate()
+                        if proc_ps.returncode == 0 and out_ps:
+                            ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
+                            if len(ps_parts) >= 2:
+                                rss_kb = int(ps_parts[0].strip())
+                                threads = int(ps_parts[1].strip())
+                    
+                    if rss_kb > 0:
+                        rss_mb = rss_kb / 1024.0
+                        rss_gb = rss_mb / 1024.0
+                        
+                        # Get VM memory allocation from virsh (use "Memory" field which is current allocation, not "Max memory")
+                        try:
+                            # Try "Memory" first (current allocated memory)
+                            cmd = "virsh dominfo {} 2>/dev/null | grep -i '^Memory:' | awk '{{print $2}}'".format(vm)
+                            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            out, _ = proc.communicate()
+                            if out:
+                                allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
+                                allocated_mem_mb = allocated_mem_kb / 1024.0
+                                # Calculate memory usage percentage
+                                if allocated_mem_mb > 0:
+                                    mem_percent = (rss_mb / allocated_mem_mb * 100)
+                                else:
+                                    mem_percent = 0
+                            else:
+                                # Fallback to "Max memory" if "Memory" not available
+                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
                                 proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                                 out, _ = proc.communicate()
                                 if out:
                                     allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
                                     allocated_mem_mb = allocated_mem_kb / 1024.0
-                                    # Calculate memory usage percentage
                                     if allocated_mem_mb > 0:
                                         mem_percent = (rss_mb / allocated_mem_mb * 100)
                                     else:
                                         mem_percent = 0
                                 else:
-                                    # Fallback to "Max memory" if "Memory" not available
-                                    cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
-                                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                    out, _ = proc.communicate()
-                                    if out:
-                                        allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
-                                        allocated_mem_mb = allocated_mem_kb / 1024.0
-                                        if allocated_mem_mb > 0:
-                                            mem_percent = (rss_mb / allocated_mem_mb * 100)
-                                        else:
-                                            mem_percent = 0
-                                    else:
-                                        allocated_mem_mb = 0
-                                        mem_percent = 0
-                            except Exception:
-                                allocated_mem_mb = 0
-                                mem_percent = 0
-                            
-                            # Get CPU allocation (vCPUs)
-                            try:
-                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'CPU(s)' | awk '{{print $2}}'".format(vm)
-                                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                out, _ = proc.communicate()
-                                if out:
-                                    vcpus = int(out.decode('utf-8', errors='ignore').strip())
-                                else:
-                                    vcpus = threads  # fallback to thread count
-                            except Exception:
-                                vcpus = threads
-                            
-                            # Determine status based on thresholds
-                            status = 'OK'
-                            # CPU%: ps shows total CPU usage across all cores (can exceed 100%)
-                            # Calculate average per core for threshold comparison
-                            cpu_per_core = cpu_percent / total_cores if total_cores > 0 else cpu_percent
-                            if cpu_per_core > 80:  # Average > 80% per core
-                                status = 'CRIT'
-                            elif cpu_per_core > 50:
-                                status = 'WARN'
-                            
-                            # Mem%: RSS / allocated memory
-                            if mem_percent > 90:
-                                status = 'CRIT' if status != 'CRIT' else 'CRIT'
-                            elif mem_percent > 75:
-                                status = 'WARN' if status == 'OK' else status
-                            
-                            # Format output
-                            cpu_str = '{:.1f}'.format(cpu_percent)
-                            rss_str = '{:.1f}'.format(rss_mb)
-                            # Show actual percentage (can exceed 100% in overcommit scenarios)
-                            if allocated_mem_mb > 0:
-                                mem_str = '{:.1f}%'.format(mem_percent)
-                                if mem_percent > 100:
-                                    mem_str += ' (overcommit)'
+                                    allocated_mem_mb = 0
+                                    mem_percent = 0
+                        except Exception:
+                            allocated_mem_mb = 0
+                            mem_percent = 0
+                        
+                        # Get CPU allocation (vCPUs)
+                        try:
+                            cmd = "virsh dominfo {} 2>/dev/null | grep -i 'CPU(s)' | awk '{{print $2}}'".format(vm)
+                            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            out, _ = proc.communicate()
+                            if out:
+                                vcpus = int(out.decode('utf-8', errors='ignore').strip())
                             else:
-                                mem_str = 'N/A'
-                            
-                            print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
-                                vm, pid, cpu_str, rss_str, mem_str, vcpus, status))
+                                vcpus = threads  # fallback to thread count
+                        except Exception:
+                            vcpus = threads
+                        
+                        # Determine status based on thresholds
+                        status = 'OK'
+                        # CPU%: top shows CPU usage percentage (can exceed 100% for multi-threaded processes)
+                        # For multi-threaded processes, this represents sum of all thread CPU usage
+                        # Calculate average per core for threshold comparison
+                        cpu_per_core = cpu_percent / total_cores if total_cores > 0 else cpu_percent
+                        if cpu_per_core > 80:  # Average > 80% per core
+                            status = 'CRIT'
+                        elif cpu_per_core > 50:
+                            status = 'WARN'
+                        
+                        # Mem%: RSS / allocated memory
+                        if mem_percent > 90:
+                            status = 'CRIT' if status != 'CRIT' else 'CRIT'
+                        elif mem_percent > 75:
+                            status = 'WARN' if status == 'OK' else status
+                        
+                        # Format output
+                        cpu_str = '{:.1f}'.format(cpu_percent)
+                        rss_str = '{:.1f}'.format(rss_mb)
+                        # Show actual percentage (can exceed 100% in overcommit scenarios)
+                        if allocated_mem_mb > 0:
+                            mem_str = '{:.1f}%'.format(mem_percent)
+                            if mem_percent > 100:
+                                mem_str += ' (overcommit)'
+                        else:
+                            mem_str = 'N/A'
+                        
+                        print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
+                            vm, pid, cpu_str, rss_str, mem_str, vcpus, status))
+                    else:
+                        # Skip VM if we can't get RSS
+                        continue
                 except Exception as e:
                     # Skip VM if we can't get its info
                     continue
