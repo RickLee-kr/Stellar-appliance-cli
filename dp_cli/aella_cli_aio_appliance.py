@@ -86,7 +86,6 @@ class AellaCli(cmd.Cmd, object):
             'restart': 'Restart System or Service',
             'clear': 'Clear History',
             'monitor': 'Monitor VM resources and system health',
-            'health': 'Check system health status',
             'quit': 'Exit CLI',
             'help': 'Display Help Information',
         }
@@ -203,19 +202,12 @@ class AellaCli(cmd.Cmd, object):
         # Monitor command
         self.monitor_command_help = {
             'vm': 'Monitor VM resource usage',
+            'system': 'Check system health status',
         }
 
         self.monitor_command_callback = {
             'vm': self.monitor_vm_callback,
-        }
-
-        # Health command
-        self.health_command_help = {
-            'check': 'Check system health status',
-        }
-
-        self.health_command_callback = {
-            'check': self.health_check_callback,
+            'system': self.monitor_system_callback,
         }
 
         # Shell command
@@ -445,12 +437,6 @@ class AellaCli(cmd.Cmd, object):
     def do_monitor(self, line):
         """ Monitor command """
         return self._on_nested_command(line, self.monitor_command_help, self.monitor_command_callback)
-
-    # Health command
-    @log_cmd
-    def do_health(self, line):
-        """ Health command """
-        return self._on_nested_command(line, self.health_command_help, self.health_command_callback)
 
     # Console command
     @log_cmd
@@ -1412,7 +1398,7 @@ class AellaCli(cmd.Cmd, object):
         # Show help if explicitly requested
         if param and len(param) == 1 and (param[0] == '?' or param[0] == 'help'):
             print('\nhtop <VM Name>  Monitor specific VM with htop')
-            print('                List all running VMs with resource usage\n')
+            print('                List all running VMs with detailed resource usage\n')
             return
         
         # Handle 'monitor vm htop <vm_name>'
@@ -1440,7 +1426,7 @@ class AellaCli(cmd.Cmd, object):
                 print('Failed to launch htop for VM "{}": {}\n'.format(vm_name, e))
             return
         
-        # Handle 'monitor vm' - list VMs with CPU/memory usage
+        # Handle 'monitor vm' - list VMs with detailed CPU/memory usage
         try:
             # Get running VMs
             cmd = "virsh list --name"
@@ -1456,41 +1442,123 @@ class AellaCli(cmd.Cmd, object):
                 print('No running VMs found\n')
                 return
             
-            # Print header
-            print('\n{:<15} {:<8} {:<8} {:<10}'.format('VM', 'PID', 'CPU%', 'RSS(MB)'))
-            print('-' * 45)
+            # Get system CPU cores for reference
+            cmd = "nproc"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, _ = proc.communicate()
+            total_cores = int(out.decode('utf-8', errors='ignore').strip()) if out else 1
             
-            # For each VM, get PID and resource usage
+            # Get total memory for reference
+            try:
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                    mem_total_kb = 0
+                    for line in meminfo.split('\n'):
+                        if line.startswith('MemTotal:'):
+                            mem_total_kb = int(line.split()[1])
+                            break
+                mem_total_gb = mem_total_kb / (1024.0 * 1024.0)
+            except Exception:
+                mem_total_gb = 0
+            
+            # Print header with explanations
+            print('\n' + '=' * 95)
+            print('VM Resource Usage Monitor')
+            print('=' * 95)
+            print('CPU%: Total CPU usage across all cores (can exceed 100% on multi-core systems)')
+            print('RSS:  Resident Set Size - actual physical memory used by the VM process')
+            print('Mem%: Memory usage percentage (RSS / allocated memory)')
+            print('Status: OK=Normal, WARN=High usage, CRIT=Critical')
+            print('-' * 95)
+            print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
+                'VM', 'PID', 'CPU%', 'RSS(MB)', 'Mem%', 'Cores', 'Status'))
+            print('-' * 95)
+            
+            # For each VM, get detailed resource usage
             for vm in vm_list:
                 pid_file = '/run/libvirt/qemu/{}.pid'.format(vm)
                 if not os.path.exists(pid_file):
-                    continue  # Skip silently if PID file doesn't exist
+                    continue
                 
                 try:
                     with open(pid_file, 'r') as f:
                         pid = f.read().strip()
                     
-                    # Get CPU and RSS using ps
-                    cmd = "ps -p {} -o %cpu,rss --no-headers".format(pid)
+                    # Get CPU, RSS, and threads using ps
+                    cmd = "ps -p {} -o %cpu,rss,nlwp --no-headers".format(pid)
                     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     out, err = proc.communicate()
                     
                     if proc.returncode == 0 and out:
                         parts = out.decode('utf-8', errors='ignore').strip().split()
-                        if len(parts) >= 2:
-                            cpu_percent = parts[0].strip()
+                        if len(parts) >= 3:
+                            cpu_percent = float(parts[0].strip())
                             rss_kb = int(parts[1].strip())
+                            threads = int(parts[2].strip())
                             rss_mb = rss_kb / 1024.0
-                            print('{:<15} {:<8} {:<8} {:<10.1f}'.format(vm, pid, cpu_percent, rss_mb))
-                except Exception:
+                            rss_gb = rss_mb / 1024.0
+                            
+                            # Get VM memory allocation from virsh
+                            try:
+                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
+                                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                out, _ = proc.communicate()
+                                if out:
+                                    max_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
+                                    max_mem_mb = max_mem_kb / 1024.0
+                                    mem_percent = (rss_mb / max_mem_mb * 100) if max_mem_mb > 0 else 0
+                                else:
+                                    max_mem_mb = 0
+                                    mem_percent = 0
+                            except Exception:
+                                max_mem_mb = 0
+                                mem_percent = 0
+                            
+                            # Get CPU allocation (vCPUs)
+                            try:
+                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'CPU(s)' | awk '{{print $2}}'".format(vm)
+                                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                out, _ = proc.communicate()
+                                if out:
+                                    vcpus = int(out.decode('utf-8', errors='ignore').strip())
+                                else:
+                                    vcpus = threads  # fallback to thread count
+                            except Exception:
+                                vcpus = threads
+                            
+                            # Determine status based on thresholds
+                            status = 'OK'
+                            if cpu_percent > total_cores * 80:  # Using more than 80% of total cores
+                                status = 'CRIT'
+                            elif cpu_percent > total_cores * 50:
+                                status = 'WARN'
+                            
+                            if mem_percent > 90:
+                                status = 'CRIT' if status != 'CRIT' else 'CRIT'
+                            elif mem_percent > 75:
+                                status = 'WARN' if status == 'OK' else status
+                            
+                            # Format output
+                            cpu_str = '{:.1f}'.format(cpu_percent)
+                            rss_str = '{:.1f}'.format(rss_mb)
+                            mem_str = '{:.1f}%'.format(mem_percent) if max_mem_mb > 0 else 'N/A'
+                            
+                            print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
+                                vm, pid, cpu_str, rss_str, mem_str, vcpus, status))
+                except Exception as e:
                     # Skip VM if we can't get its info
                     continue
             
+            print('-' * 95)
+            print('Legend:')
+            print('  CPU% > {}% of total cores = WARN, > {}% = CRIT'.format(int(total_cores * 0.5), int(total_cores * 0.8)))
+            print('  Mem% > 75% = WARN, > 90% = CRIT')
+            print('  Use "monitor vm htop <VM Name>" for detailed process monitoring')
             print('')
         except Exception as e:
             print('Failed to monitor VMs: {}\n'.format(e))
 
-    def health_check_callback(self, key, param):
+    def monitor_system_callback(self, key, param):
         """Check system health status"""
         try:
             # 1. CPU load
@@ -2323,13 +2391,6 @@ class AellaCli(cmd.Cmd, object):
             completions = [f for f in self.monitor_command_help.keys() if f.startswith(text)]
         return completions
 
-    def complete_health(self, text, line, begidx, endidx):
-        """Tab completion for health command"""
-        if not text:
-            completions = self.health_command_help.keys()
-        else:
-            completions = [f for f in self.health_command_help.keys() if f.startswith(text)]
-        return completions
 
     # Check to see whether service port opened or not
     def service_is_running(self, service_port):
