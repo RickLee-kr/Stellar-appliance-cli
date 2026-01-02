@@ -534,20 +534,114 @@ class AellaCli(cmd.Cmd, object):
     
 
     def show_dns_callback(self, key, param):
+        """Show DNS servers configured in interface configuration files"""
         status = 0
         output = None
-        cmd = "cat /etc/resolv.conf"
+        dns_servers = []
+        interfaces_with_dns = {}
+        
         try:
-            check_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-            result = check_proc.communicate()[0]
-            result = result.decode()
-            tokens = re.findall(".*\s+(\d+\.\d+\.\d+\.\d+).*", result)
+            # Read /etc/network/interfaces
+            interfaces_file = "/etc/network/interfaces"
+            if os.path.exists(interfaces_file):
+                with open(interfaces_file, 'r') as f:
+                    lines = f.readlines()
+                    current_interface = None
+                    for line in lines:
+                        # Match interface name
+                        iface_match = re.match(r'^\s*(auto|iface)\s+(\S+)', line)
+                        if iface_match:
+                            current_interface = iface_match.group(2)
+                        # Match dns-nameservers
+                        dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
+                        if dns_match and current_interface:
+                            dns_list = dns_match.group(1).strip().split()
+                            # Filter valid IP addresses
+                            valid_dns = [dns for dns in dns_list if self.valid_ipv4_address(dns)]
+                            if valid_dns:
+                                if current_interface not in interfaces_with_dns:
+                                    interfaces_with_dns[current_interface] = []
+                                interfaces_with_dns[current_interface].extend(valid_dns)
+                                dns_servers.extend(valid_dns)
+            
+            # Read /etc/network/interfaces.d/*.cfg files
+            interfaces_d_dir = "/etc/network/interfaces.d"
+            if os.path.exists(interfaces_d_dir):
+                for filename in os.listdir(interfaces_d_dir):
+                    if filename.endswith('.cfg'):
+                        filepath = os.path.join(interfaces_d_dir, filename)
+                        try:
+                            with open(filepath, 'r') as f:
+                                lines = f.readlines()
+                                current_interface = None
+                                for line in lines:
+                                    # Match interface name
+                                    iface_match = re.match(r'^\s*(auto|iface)\s+(\S+)', line)
+                                    if iface_match:
+                                        current_interface = iface_match.group(2)
+                                    # Match dns-nameservers
+                                    dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
+                                    if dns_match and current_interface:
+                                        dns_list = dns_match.group(1).strip().split()
+                                        # Filter valid IP addresses
+                                        valid_dns = [dns for dns in dns_list if self.valid_ipv4_address(dns)]
+                                        if valid_dns:
+                                            if current_interface not in interfaces_with_dns:
+                                                interfaces_with_dns[current_interface] = []
+                                            interfaces_with_dns[current_interface].extend(valid_dns)
+                                            dns_servers.extend(valid_dns)
+                        except Exception:
+                            continue
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_dns = []
+            for dns in dns_servers:
+                if dns not in seen:
+                    seen.add(dns)
+                    unique_dns.append(dns)
+            
+            # Format output
             output = "\n"
-            output += "\n".join(tokens)
+            if interfaces_with_dns:
+                output += "DNS servers configured per interface:\n"
+                for iface in sorted(interfaces_with_dns.keys()):
+                    dns_list = interfaces_with_dns[iface]
+                    output += "  {}: {}\n".format(iface, " ".join(dns_list))
+                output += "\nAll DNS servers:\n"
+                for dns in unique_dns:
+                    output += "  {}\n".format(dns)
+            elif unique_dns:
+                # Fallback: just show DNS servers if no interface info
+                output += "DNS servers:\n"
+                for dns in unique_dns:
+                    output += "  {}\n".format(dns)
+            else:
+                # No DNS found in interface configs, try resolv.conf as fallback
+                try:
+                    cmd = "cat /etc/resolv.conf 2>/dev/null"
+                    check_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    result = check_proc.communicate()[0]
+                    if result:
+                        result = result.decode()
+                        tokens = re.findall(r"nameserver\s+(\d+\.\d+\.\d+\.\d+)", result)
+                        if tokens:
+                            output += "DNS servers (from /etc/resolv.conf):\n"
+                            for dns in tokens:
+                                if dns != '127.0.0.53':  # Skip systemd-resolved stub
+                                    output += "  {}\n".format(dns)
+                        else:
+                            output += "No DNS servers configured\n"
+                    else:
+                        output += "No DNS servers configured\n"
+                except Exception:
+                    output += "No DNS servers configured\n"
             output += "\n"
         except Exception as e:
-            print("Failed to get DNS servers: {}".format(e))
+            output = "\nFailed to get DNS servers: {}\n".format(e)
+        
         print(output)
+        return status, output
 
 
     def is_sensor_host_mode(self):
