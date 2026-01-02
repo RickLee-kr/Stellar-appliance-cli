@@ -1465,9 +1465,11 @@ class AellaCli(cmd.Cmd, object):
             print('\n' + '=' * 95)
             print('VM Resource Usage Monitor')
             print('=' * 95)
-            print('CPU%: Total CPU usage across all cores (can exceed 100% on multi-core systems)')
-            print('RSS:  Resident Set Size - actual physical memory used by the VM process')
+            print('CPU%: Total CPU usage (sum across all cores, can exceed 100% on multi-core systems)')
+            print('      Example: 200% on 4-core system = 2 cores fully utilized (50% per core average)')
+            print('RSS:  Resident Set Size - actual physical memory used by the VM process (MB)')
             print('Mem%: Memory usage percentage (RSS / allocated memory)')
+            print('      May exceed 100% in overcommit scenarios (RSS > allocated)')
             print('Status: OK=Normal, WARN=High usage, CRIT=Critical')
             print('-' * 95)
             print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
@@ -1498,20 +1500,37 @@ class AellaCli(cmd.Cmd, object):
                             rss_mb = rss_kb / 1024.0
                             rss_gb = rss_mb / 1024.0
                             
-                            # Get VM memory allocation from virsh
+                            # Get VM memory allocation from virsh (use "Memory" field which is current allocation, not "Max memory")
                             try:
-                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
+                                # Try "Memory" first (current allocated memory)
+                                cmd = "virsh dominfo {} 2>/dev/null | grep -i '^Memory:' | awk '{{print $2}}'".format(vm)
                                 proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                                 out, _ = proc.communicate()
                                 if out:
-                                    max_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
-                                    max_mem_mb = max_mem_kb / 1024.0
-                                    mem_percent = (rss_mb / max_mem_mb * 100) if max_mem_mb > 0 else 0
+                                    allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
+                                    allocated_mem_mb = allocated_mem_kb / 1024.0
+                                    # Calculate memory usage percentage
+                                    if allocated_mem_mb > 0:
+                                        mem_percent = (rss_mb / allocated_mem_mb * 100)
+                                    else:
+                                        mem_percent = 0
                                 else:
-                                    max_mem_mb = 0
-                                    mem_percent = 0
+                                    # Fallback to "Max memory" if "Memory" not available
+                                    cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
+                                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                    out, _ = proc.communicate()
+                                    if out:
+                                        allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
+                                        allocated_mem_mb = allocated_mem_kb / 1024.0
+                                        if allocated_mem_mb > 0:
+                                            mem_percent = (rss_mb / allocated_mem_mb * 100)
+                                        else:
+                                            mem_percent = 0
+                                    else:
+                                        allocated_mem_mb = 0
+                                        mem_percent = 0
                             except Exception:
-                                max_mem_mb = 0
+                                allocated_mem_mb = 0
                                 mem_percent = 0
                             
                             # Get CPU allocation (vCPUs)
@@ -1528,11 +1547,15 @@ class AellaCli(cmd.Cmd, object):
                             
                             # Determine status based on thresholds
                             status = 'OK'
-                            if cpu_percent > total_cores * 80:  # Using more than 80% of total cores
+                            # CPU%: ps shows total CPU usage across all cores (can exceed 100%)
+                            # Calculate average per core for threshold comparison
+                            cpu_per_core = cpu_percent / total_cores if total_cores > 0 else cpu_percent
+                            if cpu_per_core > 80:  # Average > 80% per core
                                 status = 'CRIT'
-                            elif cpu_percent > total_cores * 50:
+                            elif cpu_per_core > 50:
                                 status = 'WARN'
                             
+                            # Mem%: RSS / allocated memory
                             if mem_percent > 90:
                                 status = 'CRIT' if status != 'CRIT' else 'CRIT'
                             elif mem_percent > 75:
@@ -1541,7 +1564,13 @@ class AellaCli(cmd.Cmd, object):
                             # Format output
                             cpu_str = '{:.1f}'.format(cpu_percent)
                             rss_str = '{:.1f}'.format(rss_mb)
-                            mem_str = '{:.1f}%'.format(mem_percent) if max_mem_mb > 0 else 'N/A'
+                            # Show actual percentage (can exceed 100% in overcommit scenarios)
+                            if allocated_mem_mb > 0:
+                                mem_str = '{:.1f}%'.format(mem_percent)
+                                if mem_percent > 100:
+                                    mem_str += ' (overcommit)'
+                            else:
+                                mem_str = 'N/A'
                             
                             print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
                                 vm, pid, cpu_str, rss_str, mem_str, vcpus, status))
@@ -1551,8 +1580,8 @@ class AellaCli(cmd.Cmd, object):
             
             print('-' * 95)
             print('Legend:')
-            print('  CPU% > {}% of total cores = WARN, > {}% = CRIT'.format(int(total_cores * 0.5), int(total_cores * 0.8)))
-            print('  Mem% > 75% = WARN, > 90% = CRIT')
+            print('  CPU%: Average per core > 50% = WARN, > 80% = CRIT (total CPU% / {} cores)'.format(total_cores))
+            print('  Mem%: > 75% = WARN, > 90% = CRIT (based on allocated memory)')
             print('  Use "monitor vm htop <VM Name>" for detailed process monitoring')
             print('')
         except Exception as e:
