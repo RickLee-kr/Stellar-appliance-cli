@@ -77,7 +77,7 @@ class AellaCli(cmd.Cmd, object):
 
         # Root command help
         self.root_command_help = {
-            'console': 'Jump to mds2, dl-master, da-master(aka dr-master), or mds console',
+            'console': 'Jump to dl-master, da-master(aka dr-master), mds, or aio console',
             'show': 'Display Component Information',
             'set': 'Configure Component Parameters',
             'unset': 'Unset Configuration',
@@ -489,38 +489,61 @@ class AellaCli(cmd.Cmd, object):
         if not os.path.exists(ntp_conf):
             ntp_conf = "/etc/ntp.conf"  # fallback
 
-
         try:
             # 1) configured servers from config
-            cmd = "cat {} 2>/dev/null".format(ntp_conf)
-            check_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-            result = check_proc.communicate()[0].decode()
-            result = result.split("\n")
-
             server_list = []
-            for line in result:
-                pools = re.findall(r"^pool\s+(\S+)", line)
-                servers = re.findall(r"^server\s+(\S+)", line)
-                if pools:
-                    server_list.extend(pools)
-                if servers:
-                    server_list.extend(servers)
+            if os.path.exists(ntp_conf):
+                with open(ntp_conf, 'r') as f:
+                    lines = f.readlines()
+                    in_xdr_block = False
+                    for line in lines:
+                        line_stripped = line.strip()
+                        # Check for XDR_NTPSEC_CONFIG block markers
+                        if "# XDR_NTPSEC_CONFIG_BEGIN" in line:
+                            in_xdr_block = True
+                            continue
+                        if "# XDR_NTPSEC_CONFIG_END" in line:
+                            in_xdr_block = False
+                            continue
+                        
+                        # Skip commented lines (unless in XDR block, where we want all)
+                        if line_stripped.startswith('#'):
+                            continue
+                        
+                        # Match pool and server lines (not commented)
+                        pools = re.findall(r"^pool\s+(\S+)", line)
+                        servers = re.findall(r"^server\s+(\S+)", line)
+                        if pools:
+                            server_list.extend(pools)
+                        if servers:
+                            server_list.extend(servers)
 
             output = "\n"
             output += "[config] {}\n".format(ntp_conf)
-            output += "\n".join(server_list) + "\n"
+            if server_list:
+                output += "\n".join(server_list) + "\n"
+            else:
+                output += "(no NTP servers configured)\n"
 
             # 2) runtime status (align with installer validation)
             output += "\n[service]\n"
             try:
-                out = subprocess.check_output(["systemctl", "is-active", "ntpsec"]).decode("utf-8").strip()
+                out = subprocess.check_output(["systemctl", "is-active", "ntpsec"], stderr=subprocess.PIPE).decode("utf-8").strip()
             except Exception:
-                out = "unknown"
+                # Try ntp service as fallback
+                try:
+                    out = subprocess.check_output(["systemctl", "is-active", "ntp"], stderr=subprocess.PIPE).decode("utf-8").strip()
+                except Exception:
+                    out = "unknown"
             output += "ntpsec: {}\n".format(out)
 
             output += "\n[ntpq -p]\n"
             try:
-                out = subprocess.check_output(["ntpq", "-p"]).decode("utf-8").strip()
+                out = subprocess.check_output(["ntpq", "-p"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
+                if not out:
+                    out = "(no peers)"
+            except subprocess.TimeoutExpired:
+                out = "(timeout)"
             except Exception:
                 out = "(failed)"
             output += out + "\n"
@@ -529,7 +552,7 @@ class AellaCli(cmd.Cmd, object):
             return status, output
 
         except Exception as e:
-            print("Failed to get ntp servers: {}".format(e))
+            print("Failed to get ntp servers: {}\n".format(e))
             return 1, None
     
 
@@ -1116,30 +1139,73 @@ class AellaCli(cmd.Cmd, object):
         if not os.path.exists(ntp_conf):
             ntp_conf = "/etc/ntp.conf"  # fallback
 
-        p = re.escape(param[0])
+        if not os.path.exists(ntp_conf):
+            print("NTP config file not found: {}\n".format(ntp_conf))
+            return
 
-        # remove existing same server lines (pool/server) (prefix match)
-        cmd = ["grep", "-E", r"^(pool|server)\s+{0}(\S*)\s*$".format(p), ntp_conf]
-        process = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        process.communicate()
-        ret = process.wait()
-
-        if ret == 0:
-            cmd = ["sudo", "sed", "-E", "-i", r"/^(pool|server)\s+{0}(\S*)\s*$/d".format(p), ntp_conf]
-            process = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            process.communicate()
-            ret = process.wait()
-
-        # prepend "pool <server>" to top of config
-        cmd = "sudo sh -c \"printf '%s\\n' 'pool {0}' | cat - {1} > {1}.tmp && mv {1}.tmp {1}\"".format(param[0], ntp_conf)
-        ret = subprocess.call(cmd, shell=True)
-
-        if ret == 0:
-            subprocess.call(["sudo", "systemctl", "restart", "ntpsec"])
-            return "Successfully set ntp {0}\n".format(param[0])
-        else:
-            print("Failed to set ntp {0}\n".format(param[0]))
-            return "Failed to set ntp {0}\n".format(param[0])
+        try:
+            # Read current config
+            with open(ntp_conf, 'r') as f:
+                lines = f.readlines()
+            
+            # Check if server already exists
+            p = re.escape(param[0])
+            server_exists = False
+            for line in lines:
+                if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                    server_exists = True
+                    break
+            
+            if server_exists:
+                print("NTP server {} already configured\n".format(param[0]))
+                return
+            
+            # Find XDR_NTPSEC_CONFIG block
+            tag_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
+            tag_end = "# XDR_NTPSEC_CONFIG_END"
+            in_xdr_block = False
+            xdr_block_start = -1
+            xdr_block_end = -1
+            
+            for i, line in enumerate(lines):
+                if tag_begin in line:
+                    in_xdr_block = True
+                    xdr_block_start = i
+                if tag_end in line:
+                    xdr_block_end = i
+                    break
+            
+            # Add server to XDR block if it exists, otherwise create new block
+            if xdr_block_start >= 0 and xdr_block_end >= 0:
+                # Insert server line before tag_end
+                server_line = "server {}\n".format(param[0])
+                lines.insert(xdr_block_end, server_line)
+            else:
+                # Create new XDR block at end of file
+                xdr_block = "\n{}\n# Alternative NTP servers\nserver {}\n{}\n".format(
+                    tag_begin, param[0], tag_end)
+                lines.append(xdr_block)
+            
+            # Write back to file
+            with open(ntp_conf, 'w') as f:
+                f.writelines(lines)
+            
+            # Restart ntpsec service
+            try:
+                subprocess.call(["sudo", "systemctl", "restart", "ntpsec"], stderr=subprocess.PIPE)
+            except Exception:
+                # Try ntp service as fallback
+                try:
+                    subprocess.call(["sudo", "systemctl", "restart", "ntp"], stderr=subprocess.PIPE)
+                except Exception:
+                    pass
+            
+            print("Successfully set ntp {}\n".format(param[0]))
+            return "Successfully set ntp {}\n".format(param[0])
+            
+        except Exception as e:
+            print("Failed to set ntp {}: {}\n".format(param[0], e))
+            return "Failed to set ntp {}\n".format(param[0])
     
 
     def unset_ntp_callback(self, key, param):
@@ -1151,26 +1217,49 @@ class AellaCli(cmd.Cmd, object):
         if not os.path.exists(ntp_conf):
             ntp_conf = "/etc/ntp.conf"  # fallback
 
-        p = re.escape(param[0])
+        if not os.path.exists(ntp_conf):
+            print("NTP config file not found: {}\n".format(ntp_conf))
+            return 1
 
-        status = 0
-
-        cmd = ["grep", "{0}".format(param[0]), ntp_conf]
-        process = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        process.communicate()
-        ret = process.wait()
-
-        if ret == 0:
-            cmd = ["sudo", "sed", "-E", "-i", r"/^(pool|server)\s+{0}(\S*)\s*$/d".format(p), ntp_conf]
-            process = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            process.communicate()
-            ret = process.wait()
-
-        if ret == 0:
-            subprocess.call(["sudo", "systemctl", "restart", "ntpsec"])
+        try:
+            # Read current config
+            with open(ntp_conf, 'r') as f:
+                lines = f.readlines()
+            
+            p = re.escape(param[0])
+            server_found = False
+            new_lines = []
+            
+            # Remove server lines matching the pattern (not commented)
+            for line in lines:
+                if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                    server_found = True
+                    continue  # Skip this line
+                new_lines.append(line)
+            
+            if not server_found:
+                print("NTP server {} not found in configuration\n".format(param[0]))
+                return 1
+            
+            # Write back to file
+            with open(ntp_conf, 'w') as f:
+                f.writelines(new_lines)
+            
+            # Restart ntpsec service
+            try:
+                subprocess.call(["sudo", "systemctl", "restart", "ntpsec"], stderr=subprocess.PIPE)
+            except Exception:
+                # Try ntp service as fallback
+                try:
+                    subprocess.call(["sudo", "systemctl", "restart", "ntp"], stderr=subprocess.PIPE)
+                except Exception:
+                    pass
+            
+            print("Successfully unset ntp {}\n".format(param[0]))
             return 0
-        else:
-            print("Failed to unset ntp {0}\n".format(param[0]))
+            
+        except Exception as e:
+            print("Failed to unset ntp {}: {}\n".format(param[0], e))
             return 1
     
 
