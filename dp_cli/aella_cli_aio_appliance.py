@@ -131,6 +131,7 @@ class AellaCli(cmd.Cmd, object):
             'time': 'Configure System Time',
             'ntp': 'Configure NTP Server',
             'interface': 'Configure Interface Parameters',
+            'dns': 'Configure DNS Server for Interface',
             'hostname': 'Configure Host Name',
             'patches': 'Apply patches/update',
             'autostart': 'Configure VM Auto Start',
@@ -143,6 +144,7 @@ class AellaCli(cmd.Cmd, object):
             'time': self.set_time_callback,
             'ntp': self.set_ntp_callback,
             'interface': self.set_interface_callback,
+            'dns': self.set_dns_callback,
             'hostname': self.set_hostname_callback,
             'patches': self.set_patches_callback,
             'patch': self.set_patches_callback,
@@ -1207,6 +1209,32 @@ class AellaCli(cmd.Cmd, object):
             print("Failed to set ntp {}: {}\n".format(param[0], e))
             return "Failed to set ntp {}\n".format(param[0])
     
+    def set_dns_callback(self, key, param):
+        """Configure DNS servers for a network interface"""
+        if not param or param[0].endswith('?') or len(param) < 2:
+            print('\n<Interface Name> <DNS IP> [...]  Specify interface name and DNS server IP address(es)\n')
+            print('Example: set dns mgt 8.8.8.8 8.8.4.4\n')
+            return
+        
+        interface = param[0].rstrip('?')
+        if param[0].endswith('?') or interface == '?':
+            print('\n<Interface Name> <DNS IP> [...]  Specify interface name and DNS server IP address(es)\n')
+            return
+        
+        if not self.is_device_exist(interface):
+            return
+        
+        # Validate DNS IP addresses
+        dns_servers = param[1:]
+        for dns in dns_servers:
+            if not self.valid_ipv4_address(dns):
+                print('Invalid DNS server IP address format: {}\n'.format(dns))
+                return
+        
+        # Use set_interface_callback2 to set DNS
+        # Format: set interface <interface> dns <dns1> <dns2> ...
+        self.set_interface_callback2([interface, 'dns'] + dns_servers)
+        print("DNS servers configured for interface {}. Run 'set interface {} restart' to apply.\n".format(interface, interface))
 
     def unset_ntp_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 1:
@@ -2003,20 +2031,37 @@ class AellaCli(cmd.Cmd, object):
             print("Failed to get patch history: {}".format(e))
 
     def update_interface_file(self, interface, contents):
+        """Update interface configuration file.
+        For DP appliances: mgt in /etc/network/interfaces, data1g/data10g in interfaces.d/
+        For Sensor/AIO installers: all interfaces in /etc/network/interfaces
+        """
         try:
-            if interface == 'mgt':
-                with open("/etc/network/interfaces", 'w') as f:
-                    new_content = "\n".join(contents)
-                    f.write(new_content)
-            elif interface == 'data1g':
+            # Check if interface is in /etc/network/interfaces (Sensor/AIO installer format)
+            interface_in_main = False
+            if os.path.exists("/etc/network/interfaces"):
+                with open("/etc/network/interfaces", 'r') as f:
+                    for line in f:
+                        if re.match(r'^\s*(auto|iface)\s+{}\s+'.format(re.escape(interface)), line):
+                            interface_in_main = True
+                            break
+            
+            # DP appliance format: data1g/data10g in interfaces.d/
+            if interface == 'data1g' and not interface_in_main:
                 with open("/etc/network/interfaces.d/01-data1g.cfg", 'w') as f:
                     new_content = "\n".join(contents)
                     f.write(new_content)
-            elif interface == 'data10g':
+                return True
+            elif interface == 'data10g' and not interface_in_main:
                 with open("/etc/network/interfaces.d/10-data10g.cfg", 'w') as f:
                     new_content = "\n".join(contents)
                     f.write(new_content)
-            return True
+                return True
+            else:
+                # mgt or any interface in main file (Sensor/AIO installer format)
+                with open("/etc/network/interfaces", 'w') as f:
+                    new_content = "\n".join(contents)
+                    f.write(new_content)
+                return True
         except Exception as e:
             print('Failed to update interface configuration')
             print(e)
