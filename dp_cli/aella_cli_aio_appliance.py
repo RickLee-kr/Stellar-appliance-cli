@@ -1266,6 +1266,41 @@ class AellaCli(cmd.Cmd, object):
 
         self.shell_cmd_exec('sudo date -s "' + date + " " + time + '"')
 
+    def _detect_ntp_type(self):
+        """Detect which NTP implementation is in use"""
+        # Check active services
+        services_to_check = ["ntpsec", "chronyd", "systemd-timesyncd", "ntp"]
+        for svc in services_to_check:
+            try:
+                out = subprocess.check_output(["systemctl", "is-active", svc], stderr=subprocess.PIPE).decode("utf-8").strip()
+                if out == "active":
+                    if svc == "ntpsec":
+                        return "ntpsec", "/etc/ntpsec/ntp.conf", "ntpsec"
+                    elif svc == "chronyd":
+                        chrony_conf = "/etc/chrony/chrony.conf"
+                        if not os.path.exists(chrony_conf):
+                            chrony_conf = "/etc/chrony.conf"
+                        return "chrony", chrony_conf, "chronyd"
+                    elif svc == "systemd-timesyncd":
+                        return "systemd-timesyncd", "/etc/systemd/timesyncd.conf", "systemd-timesyncd"
+                    elif svc == "ntp":
+                        return "ntp", "/etc/ntp.conf", "ntp"
+            except Exception:
+                continue
+        
+        # Fallback: check config files
+        if os.path.exists("/etc/ntpsec/ntp.conf"):
+            return "ntpsec", "/etc/ntpsec/ntp.conf", "ntpsec"
+        elif os.path.exists("/etc/chrony/chrony.conf") or os.path.exists("/etc/chrony.conf"):
+            chrony_conf = "/etc/chrony/chrony.conf" if os.path.exists("/etc/chrony/chrony.conf") else "/etc/chrony.conf"
+            return "chrony", chrony_conf, "chronyd"
+        elif os.path.exists("/etc/systemd/timesyncd.conf"):
+            return "systemd-timesyncd", "/etc/systemd/timesyncd.conf", "systemd-timesyncd"
+        elif os.path.exists("/etc/ntp.conf"):
+            return "ntp", "/etc/ntp.conf", "ntp"
+        
+        return None, None, None
+
     def set_ntp_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 1:
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
@@ -1276,73 +1311,159 @@ class AellaCli(cmd.Cmd, object):
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
             return
 
-        ntp_conf = "/etc/ntpsec/ntp.conf"
-        if not os.path.exists(ntp_conf):
-            ntp_conf = "/etc/ntp.conf"  # fallback
-
-        if not os.path.exists(ntp_conf):
-            print("NTP config file not found: {}\n".format(ntp_conf))
+        # Detect NTP type
+        ntp_type, ntp_conf, service_name = self._detect_ntp_type()
+        
+        if not ntp_conf or not os.path.exists(ntp_conf):
+            print("NTP config file not found. Please ensure NTP service is installed.\n")
             return
 
         try:
-            # Read current config
-            with open(ntp_conf, 'r') as f:
-                lines = f.readlines()
-            
-            # Check if server already exists
-            p = re.escape(param[0])
-            server_exists = False
-            for line in lines:
-                if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
-                    server_exists = True
-                    break
-            
-            if server_exists:
-                print("NTP server {} already configured\n".format(param[0]))
+            # Handle systemd-timesyncd
+            if ntp_type == "systemd-timesyncd":
+                # Read current config
+                with open(ntp_conf, 'r') as f:
+                    lines = f.readlines()
+                
+                # Check if server already exists
+                p = re.escape(param[0])
+                server_exists = False
+                for line in lines:
+                    if re.match(r"^NTP=.*{0}".format(p), line) and not line.strip().startswith('#'):
+                        server_exists = True
+                        break
+                
+                if server_exists:
+                    print("NTP server {} already configured\n".format(param[0]))
+                    return
+                
+                # Find [Time] section or create it
+                new_lines = []
+                in_time_section = False
+                ntp_line_found = False
+                
+                for line in lines:
+                    if line.strip() == "[Time]":
+                        in_time_section = True
+                        new_lines.append(line)
+                    elif line.strip().startswith('[') and line.strip() != "[Time]":
+                        if in_time_section and not ntp_line_found:
+                            # Add NTP= line before next section
+                            new_lines.append("NTP={}\n".format(param[0]))
+                            ntp_line_found = True
+                        in_time_section = False
+                        new_lines.append(line)
+                    elif in_time_section:
+                        if line.strip().startswith("NTP="):
+                            # Append to existing NTP line
+                            existing_ntp = line.strip().split("=", 1)[1].strip()
+                            if existing_ntp:
+                                new_lines.append("NTP={} {}\n".format(existing_ntp, param[0]))
+                            else:
+                                new_lines.append("NTP={}\n".format(param[0]))
+                            ntp_line_found = True
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                
+                # If [Time] section doesn't exist, add it
+                if not in_time_section and not ntp_line_found:
+                    new_lines.append("\n[Time]\n")
+                    new_lines.append("NTP={}\n".format(param[0]))
+                
+                # Write back to file
+                with open(ntp_conf, 'w') as f:
+                    f.writelines(new_lines)
+                
+                # Restart systemd-timesyncd
+                subprocess.call(["sudo", "systemctl", "restart", "systemd-timesyncd"], stderr=subprocess.PIPE)
+                print("Successfully set ntp {}\n".format(param[0]))
                 return
             
-            # Find XDR_NTPSEC_CONFIG block
-            tag_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
-            tag_end = "# XDR_NTPSEC_CONFIG_END"
-            in_xdr_block = False
-            xdr_block_start = -1
-            xdr_block_end = -1
+            # Handle chrony
+            elif ntp_type == "chrony":
+                with open(ntp_conf, 'r') as f:
+                    lines = f.readlines()
+                
+                # Check if server already exists
+                p = re.escape(param[0])
+                server_exists = False
+                for line in lines:
+                    if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                        server_exists = True
+                        break
+                
+                if server_exists:
+                    print("NTP server {} already configured\n".format(param[0]))
+                    return
+                
+                # Add server line at end
+                lines.append("server {}\n".format(param[0]))
+                
+                with open(ntp_conf, 'w') as f:
+                    f.writelines(lines)
+                
+                subprocess.call(["sudo", "systemctl", "restart", "chronyd"], stderr=subprocess.PIPE)
+                print("Successfully set ntp {}\n".format(param[0]))
+                return
             
-            for i, line in enumerate(lines):
-                if tag_begin in line:
-                    in_xdr_block = True
-                    xdr_block_start = i
-                if tag_end in line:
-                    xdr_block_end = i
-                    break
-            
-            # Add server to XDR block if it exists, otherwise create new block
-            if xdr_block_start >= 0 and xdr_block_end >= 0:
-                # Insert server line before tag_end
-                server_line = "server {}\n".format(param[0])
-                lines.insert(xdr_block_end, server_line)
+            # Handle ntpsec/ntp (existing logic)
             else:
-                # Create new XDR block at end of file
-                xdr_block = "\n{}\n# Alternative NTP servers\nserver {}\n{}\n".format(
-                    tag_begin, param[0], tag_end)
-                lines.append(xdr_block)
-            
-            # Write back to file
-            with open(ntp_conf, 'w') as f:
-                f.writelines(lines)
-            
-            # Restart ntpsec service
-            try:
-                subprocess.call(["sudo", "systemctl", "restart", "ntpsec"], stderr=subprocess.PIPE)
-            except Exception:
-                # Try ntp service as fallback
+                with open(ntp_conf, 'r') as f:
+                    lines = f.readlines()
+                
+                # Check if server already exists
+                p = re.escape(param[0])
+                server_exists = False
+                for line in lines:
+                    if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                        server_exists = True
+                        break
+                
+                if server_exists:
+                    print("NTP server {} already configured\n".format(param[0]))
+                    return
+                
+                # Find XDR_NTPSEC_CONFIG block (for ntpsec)
+                tag_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
+                tag_end = "# XDR_NTPSEC_CONFIG_END"
+                xdr_block_start = -1
+                xdr_block_end = -1
+                
+                for i, line in enumerate(lines):
+                    if tag_begin in line:
+                        xdr_block_start = i
+                    if tag_end in line:
+                        xdr_block_end = i
+                        break
+                
+                # Add server to XDR block if it exists, otherwise create new block
+                if xdr_block_start >= 0 and xdr_block_end >= 0:
+                    # Insert server line before tag_end
+                    server_line = "server {}\n".format(param[0])
+                    lines.insert(xdr_block_end, server_line)
+                else:
+                    # Create new XDR block at end of file (for ntpsec) or just add server line (for ntp)
+                    if ntp_type == "ntpsec":
+                        xdr_block = "\n{}\n# Alternative NTP servers\nserver {}\n{}\n".format(
+                            tag_begin, param[0], tag_end)
+                        lines.append(xdr_block)
+                    else:
+                        lines.append("server {}\n".format(param[0]))
+                
+                # Write back to file
+                with open(ntp_conf, 'w') as f:
+                    f.writelines(lines)
+                
+                # Restart service
                 try:
-                    subprocess.call(["sudo", "systemctl", "restart", "ntp"], stderr=subprocess.PIPE)
+                    subprocess.call(["sudo", "systemctl", "restart", service_name], stderr=subprocess.PIPE)
                 except Exception:
                     pass
-            
-            print("Successfully set ntp {}\n".format(param[0]))
-            return "Successfully set ntp {}\n".format(param[0])
+                
+                print("Successfully set ntp {}\n".format(param[0]))
+                return "Successfully set ntp {}\n".format(param[0])
             
         except Exception as e:
             print("Failed to set ntp {}: {}\n".format(param[0], e))
@@ -1380,12 +1501,11 @@ class AellaCli(cmd.Cmd, object):
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
             return
 
-        ntp_conf = "/etc/ntpsec/ntp.conf"
-        if not os.path.exists(ntp_conf):
-            ntp_conf = "/etc/ntp.conf"  # fallback
-
-        if not os.path.exists(ntp_conf):
-            print("NTP config file not found: {}\n".format(ntp_conf))
+        # Detect NTP type
+        ntp_type, ntp_conf, service_name = self._detect_ntp_type()
+        
+        if not ntp_conf or not os.path.exists(ntp_conf):
+            print("NTP config file not found. Please ensure NTP service is installed.\n")
             return 1
 
         try:
@@ -1397,12 +1517,40 @@ class AellaCli(cmd.Cmd, object):
             server_found = False
             new_lines = []
             
-            # Remove server lines matching the pattern (not commented)
-            for line in lines:
-                if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
-                    server_found = True
-                    continue  # Skip this line
-                new_lines.append(line)
+            # Handle systemd-timesyncd
+            if ntp_type == "systemd-timesyncd":
+                in_time_section = False
+                for line in lines:
+                    if line.strip() == "[Time]":
+                        in_time_section = True
+                        new_lines.append(line)
+                    elif line.strip().startswith('[') and line.strip() != "[Time]":
+                        in_time_section = False
+                        new_lines.append(line)
+                    elif in_time_section and line.strip().startswith("NTP="):
+                        # Remove server from NTP= line
+                        ntp_servers = line.strip().split("=", 1)[1].strip().split()
+                        if param[0] in ntp_servers:
+                            server_found = True
+                            ntp_servers.remove(param[0])
+                            if ntp_servers:
+                                new_lines.append("NTP={}\n".format(" ".join(ntp_servers)))
+                            else:
+                                # If no servers left, comment out or remove the line
+                                new_lines.append("#NTP=\n")
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+            
+            # Handle chrony and ntpsec/ntp
+            else:
+                # Remove server lines matching the pattern (not commented)
+                for line in lines:
+                    if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                        server_found = True
+                        continue  # Skip this line
+                    new_lines.append(line)
             
             if not server_found:
                 print("NTP server {} not found in configuration\n".format(param[0]))
@@ -1412,15 +1560,11 @@ class AellaCli(cmd.Cmd, object):
             with open(ntp_conf, 'w') as f:
                 f.writelines(new_lines)
             
-            # Restart ntpsec service
+            # Restart service
             try:
-                subprocess.call(["sudo", "systemctl", "restart", "ntpsec"], stderr=subprocess.PIPE)
+                subprocess.call(["sudo", "systemctl", "restart", service_name], stderr=subprocess.PIPE)
             except Exception:
-                # Try ntp service as fallback
-                try:
-                    subprocess.call(["sudo", "systemctl", "restart", "ntp"], stderr=subprocess.PIPE)
-                except Exception:
-                    pass
+                pass
             
             print("Successfully unset ntp {}\n".format(param[0]))
             return 0
