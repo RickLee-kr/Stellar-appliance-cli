@@ -571,6 +571,26 @@ class AellaCli(cmd.Cmd, object):
                             if fallback_match:
                                 fallback_servers = fallback_match.group(1).strip().split()
                                 server_list.extend(fallback_servers)
+                    
+                    # If no servers in config, check runtime status for actual servers
+                    if not server_list:
+                        try:
+                            # Get actual NTP server from timedatectl
+                            out = subprocess.check_output(["timedatectl", "timesync-status"], 
+                                                         stderr=subprocess.PIPE, timeout=5).decode("utf-8")
+                            # Extract NTP server from output
+                            for line in out.split('\n'):
+                                if 'Server:' in line or 'NTP server:' in line:
+                                    # Extract server name/IP
+                                    server_match = re.search(r'(?:Server|NTP server):\s*(\S+)', line)
+                                    if server_match:
+                                        server_list.append(server_match.group(1))
+                        except Exception:
+                            pass
+                    
+                    # If still no servers, show default Ubuntu NTP pools
+                    if not server_list:
+                        server_list.append("(using Ubuntu default NTP pools)")
             
             # 4) Fallback to /etc/ntp.conf (legacy)
             if not server_list:
@@ -633,9 +653,21 @@ class AellaCli(cmd.Cmd, object):
             else:
                 output += "NTP service: unknown\n"
 
-            # 3) ntpq or chrony sources
-            output += "\n[ntpq -p / chrony sources]\n"
-            if ntp_type == "chrony":
+            # 3) ntpq, chrony sources, or timedatectl status
+            if ntp_type == "systemd-timesyncd":
+                output += "\n[timedatectl timesync-status]\n"
+                try:
+                    out = subprocess.check_output(["timedatectl", "timesync-status"], 
+                                                 stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
+                    if not out:
+                        out = "(no status available)"
+                    output += out + "\n"
+                except subprocess.TimeoutExpired:
+                    output += "(timeout)\n"
+                except Exception:
+                    output += "(failed - timedatectl not available)\n"
+            elif ntp_type == "chrony":
+                output += "\n[chrony sources]\n"
                 try:
                     out = subprocess.check_output(["chronyc", "sources"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
                     if not out:
@@ -646,6 +678,7 @@ class AellaCli(cmd.Cmd, object):
                 except Exception:
                     output += "(failed - chronyc not available)\n"
             else:
+                output += "\n[ntpq -p]\n"
                 try:
                     out = subprocess.check_output(["ntpq", "-p"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
                     if not out:
