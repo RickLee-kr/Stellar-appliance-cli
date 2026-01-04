@@ -486,16 +486,19 @@ class AellaCli(cmd.Cmd, object):
         status = 0
         output = None
 
-        # kt_DP-installer-v1.4.sh STEP06 uses NTPsec: /etc/ntpsec/ntp.conf
-        ntp_conf = "/etc/ntpsec/ntp.conf"
-        if not os.path.exists(ntp_conf):
-            ntp_conf = "/etc/ntp.conf"  # fallback
-
         try:
-            # 1) configured servers from config
             server_list = []
-            if os.path.exists(ntp_conf):
-                with open(ntp_conf, 'r') as f:
+            ntp_type = None
+            ntp_conf = None
+            service_name = None
+            
+            # 1) Check for ntpsec (DP installer format)
+            ntpsec_conf = "/etc/ntpsec/ntp.conf"
+            if os.path.exists(ntpsec_conf):
+                ntp_conf = ntpsec_conf
+                ntp_type = "ntpsec"
+                service_name = "ntpsec"
+                with open(ntpsec_conf, 'r') as f:
                     lines = f.readlines()
                     in_xdr_block = False
                     for line in lines:
@@ -519,36 +522,139 @@ class AellaCli(cmd.Cmd, object):
                             server_list.extend(pools)
                         if servers:
                             server_list.extend(servers)
+            
+            # 2) Check for chrony (Ubuntu 24.04 default alternative)
+            if not server_list:
+                chrony_conf = "/etc/chrony/chrony.conf"
+                if not os.path.exists(chrony_conf):
+                    chrony_conf = "/etc/chrony.conf"
+                if os.path.exists(chrony_conf):
+                    ntp_conf = chrony_conf
+                    ntp_type = "chrony"
+                    service_name = "chronyd"
+                    with open(chrony_conf, 'r') as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            line_stripped = line.strip()
+                            # Skip commented lines
+                            if line_stripped.startswith('#') or line_stripped.startswith('%'):
+                                continue
+                            # Match pool and server lines
+                            pools = re.findall(r"^pool\s+(\S+)", line)
+                            servers = re.findall(r"^server\s+(\S+)", line)
+                            if pools:
+                                server_list.extend(pools)
+                            if servers:
+                                server_list.extend(servers)
+            
+            # 3) Check for systemd-timesyncd (Ubuntu 24.04 default)
+            if not server_list:
+                timesyncd_conf = "/etc/systemd/timesyncd.conf"
+                if os.path.exists(timesyncd_conf):
+                    ntp_conf = timesyncd_conf
+                    ntp_type = "systemd-timesyncd"
+                    service_name = "systemd-timesyncd"
+                    with open(timesyncd_conf, 'r') as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            line_stripped = line.strip()
+                            # Skip commented lines and empty lines
+                            if line_stripped.startswith('#') or not line_stripped:
+                                continue
+                            # Match NTP= line
+                            ntp_match = re.match(r"^NTP=(.+)", line)
+                            if ntp_match:
+                                ntp_servers = ntp_match.group(1).strip().split()
+                                server_list.extend(ntp_servers)
+                            # Also check FallbackNTP=
+                            fallback_match = re.match(r"^FallbackNTP=(.+)", line)
+                            if fallback_match:
+                                fallback_servers = fallback_match.group(1).strip().split()
+                                server_list.extend(fallback_servers)
+            
+            # 4) Fallback to /etc/ntp.conf (legacy)
+            if not server_list:
+                legacy_ntp_conf = "/etc/ntp.conf"
+                if os.path.exists(legacy_ntp_conf):
+                    ntp_conf = legacy_ntp_conf
+                    ntp_type = "ntp"
+                    service_name = "ntp"
+                    with open(legacy_ntp_conf, 'r') as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            line_stripped = line.strip()
+                            if line_stripped.startswith('#'):
+                                continue
+                            pools = re.findall(r"^pool\s+(\S+)", line)
+                            servers = re.findall(r"^server\s+(\S+)", line)
+                            if pools:
+                                server_list.extend(pools)
+                            if servers:
+                                server_list.extend(servers)
 
+            # Format output
             output = "\n"
-            output += "[config] {}\n".format(ntp_conf)
+            if ntp_conf:
+                output += "[config] {} ({})\n".format(ntp_conf, ntp_type if ntp_type else "unknown")
+            else:
+                output += "[config] (no NTP config file found)\n"
+            
             if server_list:
                 output += "\n".join(server_list) + "\n"
             else:
                 output += "(no NTP servers configured)\n"
 
-            # 2) runtime status (align with installer validation)
+            # 2) runtime status
             output += "\n[service]\n"
-            try:
-                out = subprocess.check_output(["systemctl", "is-active", "ntpsec"], stderr=subprocess.PIPE).decode("utf-8").strip()
-            except Exception:
-                # Try ntp service as fallback
+            service_status = "unknown"
+            active_service = None
+            
+            # Check which service is actually running
+            services_to_check = ["ntpsec", "chronyd", "systemd-timesyncd", "ntp"]
+            for svc in services_to_check:
                 try:
-                    out = subprocess.check_output(["systemctl", "is-active", "ntp"], stderr=subprocess.PIPE).decode("utf-8").strip()
+                    out = subprocess.check_output(["systemctl", "is-active", svc], stderr=subprocess.PIPE).decode("utf-8").strip()
+                    if out == "active":
+                        active_service = svc
+                        service_status = out
+                        break
                 except Exception:
-                    out = "unknown"
-            output += "ntpsec: {}\n".format(out)
+                    continue
+            
+            if active_service:
+                output += "{}: {}\n".format(active_service, service_status)
+            elif service_name:
+                # Check the detected service
+                try:
+                    out = subprocess.check_output(["systemctl", "is-active", service_name], stderr=subprocess.PIPE).decode("utf-8").strip()
+                    output += "{}: {}\n".format(service_name, out)
+                except Exception:
+                    output += "{}: unknown\n".format(service_name)
+            else:
+                output += "NTP service: unknown\n"
 
-            output += "\n[ntpq -p]\n"
-            try:
-                out = subprocess.check_output(["ntpq", "-p"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
-                if not out:
-                    out = "(no peers)"
-            except subprocess.TimeoutExpired:
-                out = "(timeout)"
-            except Exception:
-                out = "(failed)"
-            output += out + "\n"
+            # 3) ntpq or chrony sources
+            output += "\n[ntpq -p / chrony sources]\n"
+            if ntp_type == "chrony":
+                try:
+                    out = subprocess.check_output(["chronyc", "sources"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
+                    if not out:
+                        out = "(no sources)"
+                    output += out + "\n"
+                except subprocess.TimeoutExpired:
+                    output += "(timeout)\n"
+                except Exception:
+                    output += "(failed - chronyc not available)\n"
+            else:
+                try:
+                    out = subprocess.check_output(["ntpq", "-p"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
+                    if not out:
+                        out = "(no peers)"
+                    output += out + "\n"
+                except subprocess.TimeoutExpired:
+                    output += "(timeout)\n"
+                except Exception:
+                    output += "(failed - ntpq not available)\n"
 
             print(output)
             return status, output
