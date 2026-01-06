@@ -61,20 +61,20 @@ Firewall rule management using iptables:
 
 ```bash
 show acl                   # Display current iptables INPUT chain rules
-set acl allow <IP/network> <port> [port2 ...] | all [description]  # Add allow rule
-set acl deny <IP/network> <port> [port2 ...] | all [description]   # Add deny rule
+set acl allow <IP/network> <port> [port2 ...] | all [description]  # Allow access from IP/network to port(s)
+set acl deny <IP/network> <port> [port2 ...] | all [description]   # Deny access from IP/network to port(s)
 unset acl <IP/network> <port> [port2 ...] | all                    # Remove rule
 ```
 
 **Examples:**
 ```bash
-# Allow specific port for single IP
+# Allow access to port 22 from single IP
 set acl allow 192.168.1.100 22 "Admin SSH access"
 
-# Allow multiple ports for network
+# Allow access to multiple ports from network
 set acl allow 192.168.1.0/24 80 443 "Web servers"
 
-# Allow all ports for network
+# Allow access to all ports from network
 set acl allow 10.0.0.0/8 all "Internal network"
 
 # Remove rule
@@ -82,13 +82,15 @@ unset acl 192.168.1.100 22
 ```
 
 **Features:**
-- Supports IP addresses or CIDR networks (e.g., `192.168.1.0/24`)
+- Controls access **from** source IP addresses or CIDR networks (e.g., `192.168.1.0/24`) **to** destination ports
 - Supports single port, multiple ports, or all ports
 - Optional description/comment for each rule
 - View rules with descriptions using `show acl` command
 - Local interface IPs (e.g., 192.168.0.100) are always allowed and cannot be blocked
 - Default policy is ACCEPT when no user-defined ACL rules are configured
-- Local interface IP rules are hidden from `show acl` output and cannot be removed
+- Local interface IP rules are hidden from `show acl` output and cannot be removed using `unset acl`
+
+**Note:** ACL rules control incoming traffic. For example, `set acl allow 192.168.1.100 22` allows access **from** 192.168.1.100 **to** port 22 on this KVM host.
 
 ### 4. System Information Display
 
