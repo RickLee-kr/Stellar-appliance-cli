@@ -105,6 +105,7 @@ class AellaCli(cmd.Cmd, object):
             'cli': 'Show CLI History',
             'patch_history': 'Show the History of Patches Applied',
             'autostart': 'Show VM Auto Start Configuration',
+            'acl': 'Show Access Control List (iptables rules)',
         }
 
         # Show command callback
@@ -122,6 +123,7 @@ class AellaCli(cmd.Cmd, object):
             'cli': self.show_cli_callback,
             'patch_history': self.show_patch_history_callback,
             'autostart': self.show_autostart_callback,
+            'acl': self.show_acl_callback,
         }
 
         # Set command help
@@ -135,6 +137,7 @@ class AellaCli(cmd.Cmd, object):
             'hostname': 'Configure Host Name',
             'patches': 'Apply patches/update',
             'autostart': 'Configure VM Auto Start',
+            'acl': 'Configure Access Control List (iptables rules)',
         }
 
         # Set command callback
@@ -149,16 +152,19 @@ class AellaCli(cmd.Cmd, object):
             'patches': self.set_patches_callback,
             'patch': self.set_patches_callback,
             'autostart': self.set_autostart_callback,
+            'acl': self.set_acl_callback,
         }
 
         self.unset_command_help = {
             'ntp': 'Unset NTP Server',
-            'interface': 'Unset interface configuration'
+            'interface': 'Unset interface configuration',
+            'acl': 'Unset Access Control List (iptables rules)'
         }
 
         self.unset_command_callback = {
             'ntp': self.unset_ntp_callback,
-            'interface': self.unset_interface_callback
+            'interface': self.unset_interface_callback,
+            'acl': self.unset_acl_callback
         }
 
         # Dynamically build start command help and callback from virsh list
@@ -807,6 +813,37 @@ class AellaCli(cmd.Cmd, object):
         print(output)
         return status, output
 
+    def show_acl_callback(self, key, param):
+        """Show current iptables ACL rules"""
+        try:
+            output = "\n"
+            output += "=" * 95 + "\n"
+            output += "Access Control List (iptables INPUT chain rules)\n"
+            output += "=" * 95 + "\n"
+            
+            # Get iptables rules for INPUT chain
+            cmd = "sudo iptables -L INPUT -n -v --line-numbers"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            
+            if proc.returncode == 0 and out:
+                output += out.decode('utf-8', errors='ignore')
+            else:
+                if err:
+                    error_msg = err.decode('utf-8', errors='ignore')
+                    if "iptables" in error_msg.lower() or "command not found" in error_msg.lower():
+                        output += "iptables not available or not installed\n"
+                    else:
+                        output += "Failed to get iptables rules: {}\n".format(error_msg)
+                else:
+                    output += "No iptables rules found\n"
+            
+            output += "\n"
+            print(output)
+            return 0, output
+        except Exception as e:
+            print("Failed to show ACL rules: {}\n".format(e))
+            return 1, None
 
     def is_sensor_host_mode(self):
         """Detect whether this host is a Sensor KVM host (mds/mds2, br-data, etc.)."""
@@ -1496,6 +1533,115 @@ class AellaCli(cmd.Cmd, object):
         self.set_interface_callback2([interface, 'dns'] + dns_servers)
         print("DNS servers configured for interface {}. Run 'set interface {} restart' to apply.\n".format(interface, interface))
 
+    def set_acl_callback(self, key, param):
+        """Configure iptables ACL rules
+        Usage: set acl allow <IP/network> <port> [port2 ...] | all
+               set acl deny <IP/network> <port> [port2 ...] | all
+        """
+        if not param or len(param) < 3:
+            print('\n<action> <IP/network> <port> [...] | all  Configure ACL rule')
+            print('  action: allow or deny')
+            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
+            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
+            print('  Multiple ports can be specified separated by space')
+            print('\nExamples:')
+            print('  set acl allow 192.168.1.100 22')
+            print('  set acl allow 192.168.1.0/24 80 443')
+            print('  set acl allow 10.0.0.0/8 all')
+            print('  set acl deny 192.168.1.200 22\n')
+            return
+        
+        action = param[0].lower()
+        if action not in ['allow', 'deny']:
+            print('Invalid action: Must be "allow" or "deny"\n')
+            return
+        
+        source = param[1]
+        # Validate IP/network
+        if '/' in source:
+            # Network CIDR format
+            parts = source.split('/')
+            if not self.valid_ipv4_address(parts[0]) or not parts[1].isdigit() or int(parts[1]) > 32:
+                print('Invalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n')
+                return
+        else:
+            # Single IP
+            if not self.valid_ipv4_address(source):
+                print('Invalid IP address format: {}\n'.format(source))
+                return
+        
+        ports = param[2:]
+        if not ports:
+            print('Port specification required\n')
+            return
+        
+        # Check if "all" is specified
+        if 'all' in ports:
+            if len(ports) > 1:
+                print('Cannot specify "all" with other ports\n')
+                return
+            ports = ['all']
+        
+        try:
+            # Build iptables rules
+            rules_added = []
+            for port in ports:
+                if port == 'all':
+                    # Rule for all ports
+                    if action == 'allow':
+                        cmd = "sudo iptables -I INPUT -s {} -j ACCEPT".format(source)
+                        check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} -j DROP".format(source)
+                        check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
+                else:
+                    # Validate port number
+                    try:
+                        port_num = int(port)
+                        if port_num < 1 or port_num > 65535:
+                            print('Invalid port number: {} (must be 1-65535)\n'.format(port))
+                            return
+                    except ValueError:
+                        print('Invalid port number: {}\n'.format(port))
+                        return
+                    
+                    # Rule for specific port
+                    if action == 'allow':
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
+                
+                # Check if rule already exists
+                check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                check_proc.communicate()
+                
+                if check_proc.returncode == 0:
+                    print('ACL rule already exists: {} {} {}\n'.format(action, source, port))
+                    continue
+                
+                # Add rule
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc.communicate()
+                
+                if proc.returncode == 0:
+                    rules_added.append((action, source, port))
+                else:
+                    error_msg = err.decode('utf-8', errors='ignore') if err else 'Unknown error'
+                    print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
+            
+            if rules_added:
+                print('Successfully added ACL rules:\n')
+                for action, source, port in rules_added:
+                    print('  {} {} {}\n'.format(action, source, port))
+                print('Note: Rules are added to iptables. To make them persistent, save iptables rules.\n')
+            else:
+                print('No new rules were added.\n')
+            
+        except Exception as e:
+            print('Failed to set ACL: {}\n'.format(e))
+
     def unset_ntp_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 1:
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
@@ -1572,7 +1718,100 @@ class AellaCli(cmd.Cmd, object):
         except Exception as e:
             print("Failed to unset ntp {}: {}\n".format(param[0], e))
             return 1
-    
+
+    def unset_acl_callback(self, key, param):
+        """Remove iptables ACL rules
+        Usage: unset acl <IP/network> <port> [port2 ...] | all
+        """
+        if not param or len(param) < 2:
+            print('\n<IP/network> <port> [...] | all  Remove ACL rule')
+            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
+            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
+            print('  Multiple ports can be specified separated by space')
+            print('\nExamples:')
+            print('  unset acl 192.168.1.100 22')
+            print('  unset acl 192.168.1.0/24 80 443')
+            print('  unset acl 10.0.0.0/8 all\n')
+            return
+        
+        source = param[0]
+        # Validate IP/network
+        if '/' in source:
+            # Network CIDR format
+            parts = source.split('/')
+            if not self.valid_ipv4_address(parts[0]) or not parts[1].isdigit() or int(parts[1]) > 32:
+                print('Invalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n')
+                return
+        else:
+            # Single IP
+            if not self.valid_ipv4_address(source):
+                print('Invalid IP address format: {}\n'.format(source))
+                return
+        
+        ports = param[1:]
+        if not ports:
+            print('Port specification required\n')
+            return
+        
+        # Check if "all" is specified
+        if 'all' in ports:
+            if len(ports) > 1:
+                print('Cannot specify "all" with other ports\n')
+                return
+            ports = ['all']
+        
+        try:
+            # Remove iptables rules
+            rules_removed = []
+            for port in ports:
+                if port == 'all':
+                    # Remove all rules for this source (both ACCEPT and DROP, all ports)
+                    # Get all rules matching the source
+                    cmd = "sudo iptables -L INPUT -n --line-numbers | grep -E '^[0-9]+.*{}' | awk '{{print $1}}'".format(source)
+                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out, err = proc.communicate()
+                    if out:
+                        line_nums = out.decode('utf-8', errors='ignore').strip().split('\n')
+                        # Remove in reverse order to maintain line numbers
+                        for line_num in reversed(line_nums):
+                            if line_num.isdigit():
+                                del_cmd = "sudo iptables -D INPUT {}".format(line_num)
+                                del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                del_proc.communicate()
+                                if del_proc.returncode == 0:
+                                    if (source, port) not in rules_removed:
+                                        rules_removed.append((source, port))
+                else:
+                    # Validate port number
+                    try:
+                        port_num = int(port)
+                        if port_num < 1 or port_num > 65535:
+                            print('Invalid port number: {} (must be 1-65535)\n'.format(port))
+                            continue
+                    except ValueError:
+                        print('Invalid port number: {}\n'.format(port))
+                        continue
+                    
+                    # Try to remove both ACCEPT and DROP rules for specific port
+                    for target in ['ACCEPT', 'DROP']:
+                        # Use iptables -D with rule specification
+                        del_cmd = "sudo iptables -D INPUT -s {} -p tcp --dport {} -j {}".format(source, port_num, target)
+                        del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        del_proc.communicate()
+                        if del_proc.returncode == 0:
+                            rules_removed.append((source, port))
+                            break
+            
+            if rules_removed:
+                print('Successfully removed ACL rules:\n')
+                for source, port in rules_removed:
+                    print('  {} {}\n'.format(source, port))
+            else:
+                print('No matching ACL rules found to remove.\n')
+                print('Use "show acl" to see current rules.\n')
+            
+        except Exception as e:
+            print('Failed to unset ACL: {}\n'.format(e))
 
     def unset_interface_callback(self, key, param):
         if self.is_sensor_host_mode():
