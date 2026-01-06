@@ -814,7 +814,7 @@ class AellaCli(cmd.Cmd, object):
         return status, output
 
     def show_acl_callback(self, key, param):
-        """Show current iptables ACL rules"""
+        """Show current iptables ACL rules with descriptions"""
         try:
             output = "\n"
             output += "=" * 95 + "\n"
@@ -822,12 +822,68 @@ class AellaCli(cmd.Cmd, object):
             output += "=" * 95 + "\n"
             
             # Get iptables rules for INPUT chain
+            # iptables -L automatically shows comments if comment module is used
             cmd = "sudo iptables -L INPUT -n -v --line-numbers"
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
             
             if proc.returncode == 0 and out:
-                output += out.decode('utf-8', errors='ignore')
+                rules_output = out.decode('utf-8', errors='ignore')
+                
+                # Also get detailed rule info with comments from iptables-save
+                cmd_save = "sudo iptables-save -t filter | grep '^-A INPUT'"
+                proc_save = subprocess.Popen(cmd_save, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_save, _ = proc_save.communicate()
+                
+                # Parse rules and create comment mapping
+                rule_comments = {}
+                if out_save:
+                    save_rules = out_save.decode('utf-8', errors='ignore').split('\n')
+                    for line in save_rules:
+                        if '-A INPUT' in line and '--comment' in line:
+                            # Extract comment
+                            comment_match = re.search(r'--comment\s+"([^"]+)"', line)
+                            if comment_match:
+                                comment = comment_match.group(1)
+                                # Extract source
+                                source_match = re.search(r'-s\s+(\S+)', line)
+                                if source_match:
+                                    source = source_match.group(1)
+                                    # Extract port if exists
+                                    port_match = re.search(r'--dport\s+(\d+)', line)
+                                    port = port_match.group(1) if port_match else 'all'
+                                    # Extract target
+                                    target_match = re.search(r'-j\s+(\S+)', line)
+                                    target = target_match.group(1) if target_match else ''
+                                    
+                                    # Create unique key: source:port:target
+                                    rule_key = "{}:{}:{}".format(source, port, target)
+                                    rule_comments[rule_key] = comment
+                
+                # Format output: add comments to matching rules
+                lines = rules_output.split('\n')
+                formatted_lines = []
+                for i, line in enumerate(lines):
+                    formatted_lines.append(line)
+                    
+                    # Check if this line contains a rule (has ACCEPT or DROP)
+                    if 'ACCEPT' in line or 'DROP' in line or 'REJECT' in line:
+                        # Extract source IP/network
+                        source_match = re.search(r'\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+', line)
+                        if source_match:
+                            source = source_match.group(1)
+                            # Extract port
+                            port_match = re.search(r'dpt:(\d+)', line)
+                            port = port_match.group(1) if port_match else 'all'
+                            # Extract target
+                            target_match = re.search(r'\s+(ACCEPT|DROP|REJECT)\s*$', line)
+                            target = target_match.group(1) if target_match else ''
+                            
+                            rule_key = "{}:{}:{}".format(source, port, target)
+                            if rule_key in rule_comments:
+                                formatted_lines.append("    [Description] {}".format(rule_comments[rule_key]))
+                
+                output += '\n'.join(formatted_lines)
             else:
                 if err:
                     error_msg = err.decode('utf-8', errors='ignore')
@@ -1535,20 +1591,21 @@ class AellaCli(cmd.Cmd, object):
 
     def set_acl_callback(self, key, param):
         """Configure iptables ACL rules
-        Usage: set acl allow <IP/network> <port> [port2 ...] | all
-               set acl deny <IP/network> <port> [port2 ...] | all
+        Usage: set acl allow <IP/network> <port> [port2 ...] | all [description]
+               set acl deny <IP/network> <port> [port2 ...] | all [description]
         """
         if not param or len(param) < 3:
-            print('\n<action> <IP/network> <port> [...] | all  Configure ACL rule')
+            print('\n<action> <IP/network> <port> [...] | all [description]  Configure ACL rule')
             print('  action: allow or deny')
             print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
             print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
             print('  Multiple ports can be specified separated by space')
+            print('  description: Optional description/comment for this rule')
             print('\nExamples:')
-            print('  set acl allow 192.168.1.100 22')
-            print('  set acl allow 192.168.1.0/24 80 443')
-            print('  set acl allow 10.0.0.0/8 all')
-            print('  set acl deny 192.168.1.200 22\n')
+            print('  set acl allow 192.168.1.100 22 "Admin SSH access"')
+            print('  set acl allow 192.168.1.0/24 80 443 "Web servers"')
+            print('  set acl allow 10.0.0.0/8 all "Internal network"')
+            print('  set acl deny 192.168.1.200 22 "Blocked user"\n')
             return
         
         action = param[0].lower()
@@ -1570,7 +1627,27 @@ class AellaCli(cmd.Cmd, object):
                 print('Invalid IP address format: {}\n'.format(source))
                 return
         
-        ports = param[2:]
+        # Extract ports and description
+        # Description is the last parameter if it's not a port number and not "all"
+        remaining_params = param[2:]
+        if not remaining_params:
+            print('Port specification required\n')
+            return
+        
+        ports = []
+        description = None
+        
+        # Simple logic: collect ports until we hit a non-port parameter
+        # Then treat the rest as description
+        for i, p in enumerate(remaining_params):
+            # If it's "all" or a digit, it's a port
+            if p == 'all' or p.isdigit():
+                ports.append(p)
+            else:
+                # First non-port parameter - treat rest as description
+                description = ' '.join(remaining_params[i:])
+                break
+        
         if not ports:
             print('Port specification required\n')
             return
@@ -1582,17 +1659,27 @@ class AellaCli(cmd.Cmd, object):
                 return
             ports = ['all']
         
+        # Clean up description (remove quotes)
+        if description:
+            description = description.strip('"').strip("'").strip()
+        
         try:
-            # Build iptables rules
+            # Build iptables rules with comment
             rules_added = []
+            comment_part = ""
+            if description:
+                # Escape quotes and special characters for shell
+                escaped_desc = description.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+                comment_part = '-m comment --comment "{}"'.format(escaped_desc)
+            
             for port in ports:
                 if port == 'all':
                     # Rule for all ports
                     if action == 'allow':
-                        cmd = "sudo iptables -I INPUT -s {} -j ACCEPT".format(source)
+                        cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} -j DROP".format(source)
+                        cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
                 else:
                     # Validate port number
@@ -1607,13 +1694,13 @@ class AellaCli(cmd.Cmd, object):
                     
                     # Rule for specific port
                     if action == 'allow':
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port_num, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port_num, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
                 
-                # Check if rule already exists
+                # Check if rule already exists (without comment check for simplicity)
                 check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 check_proc.communicate()
                 
@@ -1626,15 +1713,31 @@ class AellaCli(cmd.Cmd, object):
                 out, err = proc.communicate()
                 
                 if proc.returncode == 0:
-                    rules_added.append((action, source, port))
+                    rules_added.append((action, source, port, description))
                 else:
                     error_msg = err.decode('utf-8', errors='ignore') if err else 'Unknown error'
-                    print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
+                    # If comment module not available, try without comment
+                    if 'comment' in error_msg.lower() or 'match' in error_msg.lower():
+                        # Retry without comment
+                        cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
+                        proc2 = subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        proc2.communicate()
+                        if proc2.returncode == 0:
+                            rules_added.append((action, source, port, None))
+                            print('Note: Comment not supported (iptables comment module not available), rule added without description.\n')
+                        else:
+                            print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
+                    else:
+                        print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
             
             if rules_added:
                 print('Successfully added ACL rules:\n')
-                for action, source, port in rules_added:
-                    print('  {} {} {}\n'.format(action, source, port))
+                for rule in rules_added:
+                    action, source, port, desc = rule
+                    if desc:
+                        print('  {} {} {} ({})\n'.format(action, source, port, desc))
+                    else:
+                        print('  {} {} {}\n'.format(action, source, port))
                 print('Note: Rules are added to iptables. To make them persistent, save iptables rules.\n')
             else:
                 print('No new rules were added.\n')
