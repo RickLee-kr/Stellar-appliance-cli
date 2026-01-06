@@ -326,10 +326,75 @@ class AellaCli(cmd.Cmd, object):
 
     # Help command
     def do_help(self, line):
-        print('')
-        for cmd in sorted(self.root_command_help.keys()):
-            print('{0:15} {1}'.format(cmd, self.root_command_help[cmd]))
-        print('')
+        """Display help information for commands"""
+        if not line or line.strip() == '':
+            # Show main help menu
+            print('')
+            print('Available Commands:')
+            print('=' * 70)
+            for cmd in sorted(self.root_command_help.keys()):
+                if cmd != 'help':  # Don't show help command in the list
+                    print('{0:15} {1}'.format(cmd, self.root_command_help[cmd]))
+            print('')
+            print('For more information on a specific command, type: help <command>')
+            print('For nested commands (e.g., show, set), type: <command> help')
+            print('')
+        else:
+            # Show help for specific command
+            cmd_name = line.strip().split()[0]
+            if cmd_name in self.root_command_help:
+                print('')
+                print('Command: {}'.format(cmd_name))
+                print('Description: {}'.format(self.root_command_help[cmd_name]))
+                print('')
+                # Show nested command help if available
+                if cmd_name == 'show' and hasattr(self, 'show_command_help'):
+                    print('Available sub-commands:')
+                    for sub_cmd in sorted(self.show_command_help.keys()):
+                        print('  {0:15} {1}'.format(sub_cmd, self.show_command_help[sub_cmd]))
+                    print('')
+                    print('Usage: show <sub-command>')
+                elif cmd_name == 'set' and hasattr(self, 'set_command_help'):
+                    print('Available sub-commands:')
+                    for sub_cmd in sorted(self.set_command_help.keys()):
+                        print('  {0:15} {1}'.format(sub_cmd, self.set_command_help[sub_cmd]))
+                    print('')
+                    print('Usage: set <sub-command> [parameters]')
+                elif cmd_name == 'unset' and hasattr(self, 'unset_command_help'):
+                    print('Available sub-commands:')
+                    for sub_cmd in sorted(self.unset_command_help.keys()):
+                        print('  {0:15} {1}'.format(sub_cmd, self.unset_command_help[sub_cmd]))
+                    print('')
+                    print('Usage: unset <sub-command>')
+                elif cmd_name in ['start', 'restart', 'shutdown']:
+                    if hasattr(self, '{}_command_help'.format(cmd_name)):
+                        help_dict = getattr(self, '{}_command_help'.format(cmd_name))
+                        if help_dict:
+                            print('Available options:')
+                            for sub_cmd in sorted(help_dict.keys()):
+                                print('  {0:15} {1}'.format(sub_cmd, help_dict[sub_cmd]))
+                            print('')
+                            print('Usage: {} <option>'.format(cmd_name))
+                elif cmd_name == 'console':
+                    if hasattr(self, 'console_command_help'):
+                        if self.console_command_help:
+                            print('Available console options:')
+                            for sub_cmd in sorted(self.console_command_help.keys()):
+                                print('  {0:15} {1}'.format(sub_cmd, self.console_command_help[sub_cmd]))
+                            print('')
+                            print('Usage: console <vm-name>')
+                        else:
+                            print('No VMs available for console access.')
+                            print('')
+                elif cmd_name == 'monitor':
+                    print('Usage: monitor')
+                    print('Displays VM resources and system health information.')
+                    print('')
+            else:
+                print('')
+                print("Unknown command: '{}'".format(cmd_name))
+                print('Type "help" to see available commands.')
+                print('')
 
     # Shell command
     @log_cmd
