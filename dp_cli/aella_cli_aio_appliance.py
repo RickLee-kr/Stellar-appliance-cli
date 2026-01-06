@@ -835,12 +835,17 @@ class AellaCli(cmd.Cmd, object):
                 policy_line = out_policy.decode('utf-8', errors='ignore').strip()
                 if 'policy' in policy_line.lower():
                     output += "Default Policy: {}\n".format(policy_line)
+                    # If no user-defined rules exist, default policy should be ACCEPT
+                    if 'ACCEPT' in policy_line:
+                        output += "Note: Default policy is ACCEPT (all traffic allowed when no ACL rules are set)\n"
                     output += "\n"
             
             # Get local interface IPs
             local_ips = self._get_local_interface_ips()
             if local_ips:
-                output += "Local Interface IPs (always allowed): {}\n".format(', '.join(local_ips))
+                output += "Local Interface IPs (destination - always allowed, cannot be blocked): {}\n".format(', '.join(local_ips))
+                output += "Note: Traffic to local interface IPs is always allowed regardless of ACL deny rules\n"
+                output += "Note: Local interface IP rules are hidden from this list and cannot be removed\n"
                 output += "\n"
             
             # Get iptables rules for INPUT chain
@@ -857,53 +862,119 @@ class AellaCli(cmd.Cmd, object):
                 proc_save = subprocess.Popen(cmd_save, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out_save, _ = proc_save.communicate()
                 
-                # Parse rules and create comment mapping
+                # Parse rules and create comment mapping (excluding local IP rules)
                 rule_comments = {}
                 if out_save:
                     save_rules = out_save.decode('utf-8', errors='ignore').split('\n')
                     for line in save_rules:
-                        if '-A INPUT' in line and '--comment' in line:
-                            # Extract comment
-                            comment_match = re.search(r'--comment\s+"([^"]+)"', line)
-                            if comment_match:
-                                comment = comment_match.group(1)
-                                # Extract source
-                                source_match = re.search(r'-s\s+(\S+)', line)
-                                if source_match:
-                                    source = source_match.group(1)
-                                    # Extract port if exists
-                                    port_match = re.search(r'--dport\s+(\d+)', line)
-                                    port = port_match.group(1) if port_match else 'all'
-                                    # Extract target
-                                    target_match = re.search(r'-j\s+(\S+)', line)
-                                    target = target_match.group(1) if target_match else ''
-                                    
-                                    # Create unique key: source:port:target
-                                    rule_key = "{}:{}:{}".format(source, port, target)
-                                    rule_comments[rule_key] = comment
+                        if '-A INPUT' in line:
+                            # Skip local IP destination rules
+                            is_local_rule = False
+                            for local_ip in local_ips:
+                                if '-d {}'.format(local_ip) in line:
+                                    is_local_rule = True
+                                    break
+                            # Also skip rules with "Local interface IP" comment
+                            if 'Local interface IP' in line or 'always allow' in line.lower():
+                                is_local_rule = True
+                            
+                            if is_local_rule:
+                                continue
+                            
+                            if '--comment' in line:
+                                # Extract comment
+                                comment_match = re.search(r'--comment\s+"([^"]+)"', line)
+                                if comment_match:
+                                    comment = comment_match.group(1)
+                                    # Extract source
+                                    source_match = re.search(r'-s\s+(\S+)', line)
+                                    if source_match:
+                                        source = source_match.group(1)
+                                        # Extract port if exists
+                                        port_match = re.search(r'--dport\s+(\d+)', line)
+                                        port = port_match.group(1) if port_match else 'all'
+                                        # Extract target
+                                        target_match = re.search(r'-j\s+(\S+)', line)
+                                        target = target_match.group(1) if target_match else ''
+                                        
+                                        # Create unique key: source:port:target
+                                        rule_key = "{}:{}:{}".format(source, port, target)
+                                        rule_comments[rule_key] = comment
                 
-                # Format output: add comments to matching rules
+                # Parse iptables-save to identify local IP destination rules
+                # We'll use this to filter them out from the display
+                has_local_dest_rules = False
+                if out_save:
+                    save_rules = out_save.decode('utf-8', errors='ignore').split('\n')
+                    for line in save_rules:
+                        if '-A INPUT' in line:
+                            # Check if this is a local IP destination rule
+                            for local_ip in local_ips:
+                                if '-d {}'.format(local_ip) in line:
+                                    has_local_dest_rules = True
+                                    break
+                            # Also check for "Local interface IP" comment
+                            if 'Local interface IP' in line or 'always allow' in line.lower():
+                                has_local_dest_rules = True
+                            if has_local_dest_rules:
+                                break
+                
+                # Format output: add comments to matching rules, but filter out local IP destination rules
                 lines = rules_output.split('\n')
                 formatted_lines = []
                 for i, line in enumerate(lines):
-                    formatted_lines.append(line)
+                    # Keep chain headers
+                    if 'Chain' in line or ('num' in line.lower() and 'target' in line.lower() and 'prot' in line.lower()):
+                        formatted_lines.append(line)
+                        continue
+                    
+                    # Skip empty lines in headers
+                    if not line.strip() and i < 3:
+                        continue
                     
                     # Check if this line contains a rule (has ACCEPT or DROP)
                     if 'ACCEPT' in line or 'DROP' in line or 'REJECT' in line:
-                        # Extract source IP/network
+                        # Check if this is a local IP destination rule
+                        is_local_rule = False
+                        
+                        # If we have local destination rules and this line contains a local IP with ACCEPT,
+                        # check if it looks like a destination rule (source is 0.0.0.0/0 or wildcard)
+                        if has_local_dest_rules and 'ACCEPT' in line:
+                            for local_ip in local_ips:
+                                if local_ip in line:
+                                    # Check if source is 0.0.0.0/0 (wildcard = any source to this destination)
+                                    # This is the typical pattern for destination-based rules
+                                    if '0.0.0.0/0' in line or '0.0.0.0' in line:
+                                        # Additional check: make sure it's not a user rule with source 0.0.0.0/0
+                                        # User rules with source 0.0.0.0/0 are rare, but possible
+                                        # For safety, if the line has the local IP and wildcard source, it's likely our destination rule
+                                        is_local_rule = True
+                                        break
+                        
+                        if is_local_rule:
+                            continue  # Skip local IP destination rules
+                        
+                        formatted_lines.append(line)
+                        
+                        # Extract source IP/network for comment matching
                         source_match = re.search(r'\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+', line)
                         if source_match:
                             source = source_match.group(1)
-                            # Extract port
-                            port_match = re.search(r'dpt:(\d+)', line)
-                            port = port_match.group(1) if port_match else 'all'
-                            # Extract target
-                            target_match = re.search(r'\s+(ACCEPT|DROP|REJECT)\s*$', line)
-                            target = target_match.group(1) if target_match else ''
-                            
-                            rule_key = "{}:{}:{}".format(source, port, target)
-                            if rule_key in rule_comments:
-                                formatted_lines.append("    [Description] {}".format(rule_comments[rule_key]))
+                            # Skip if this source is a local IP (shouldn't happen for user rules, but double-check)
+                            if source not in local_ips:
+                                # Extract port
+                                port_match = re.search(r'dpt:(\d+)', line)
+                                port = port_match.group(1) if port_match else 'all'
+                                # Extract target
+                                target_match = re.search(r'\s+(ACCEPT|DROP|REJECT)\s*$', line)
+                                target = target_match.group(1) if target_match else ''
+                                
+                                rule_key = "{}:{}:{}".format(source, port, target)
+                                if rule_key in rule_comments:
+                                    formatted_lines.append("    [Description] {}".format(rule_comments[rule_key]))
+                    elif line.strip():
+                        # Other non-empty lines (might be continuation or other info)
+                        formatted_lines.append(line)
                 
                 output += '\n'.join(formatted_lines)
             else:
@@ -1689,36 +1760,36 @@ class AellaCli(cmd.Cmd, object):
             
             if out:
                 policy_line = out.decode('utf-8', errors='ignore')
-                # Check if policy is DROP or REJECT
-                if 'DROP' in policy_line or 'REJECT' in policy_line:
-                    # Count user-defined ACL rules (excluding local IP allow rules)
-                    # Get all rules and filter out local IP rules
-                    cmd_list = "sudo iptables -L INPUT -n --line-numbers"
-                    proc_list = subprocess.Popen(cmd_list, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out_list, _ = proc_list.communicate()
+                # Count user-defined ACL rules (excluding local IP allow rules)
+                # Get all rules and filter out local IP rules
+                cmd_list = "sudo iptables -L INPUT -n --line-numbers"
+                proc_list = subprocess.Popen(cmd_list, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_list, _ = proc_list.communicate()
+                
+                user_rule_count = 0
+                if out_list:
+                    lines = out_list.decode('utf-8', errors='ignore').split('\n')
+                    local_ips = self._get_local_interface_ips()
                     
-                    if out_list:
-                        lines = out_list.decode('utf-8', errors='ignore').split('\n')
-                        user_rule_count = 0
-                        local_ips = self._get_local_interface_ips()
-                        
-                        for line in lines:
-                            # Skip chain header and policy line
-                            if 'Chain' in line or 'policy' in line.lower() or not line.strip():
-                                continue
-                            # Skip local IP allow rules
-                            is_local_rule = False
-                            for local_ip in local_ips:
-                                if '-d {}'.format(local_ip) in line and 'ACCEPT' in line:
-                                    is_local_rule = True
-                                    break
-                            if not is_local_rule:
-                                user_rule_count += 1
-                        
-                        # If no user-defined rules exist, set policy to ACCEPT
-                        if user_rule_count == 0:
-                            cmd_set = "sudo iptables -P INPUT ACCEPT"
-                            subprocess.Popen(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+                    for line in lines:
+                        # Skip chain header and policy line
+                        if 'Chain' in line or 'policy' in line.lower() or not line.strip():
+                            continue
+                        # Skip local IP allow rules (destination-based rules)
+                        is_local_rule = False
+                        for local_ip in local_ips:
+                            if '-d {}'.format(local_ip) in line and 'ACCEPT' in line:
+                                is_local_rule = True
+                                break
+                        if not is_local_rule:
+                            user_rule_count += 1
+                
+                # If no user-defined rules exist, ensure policy is ACCEPT
+                if user_rule_count == 0:
+                    # Check if policy is already ACCEPT
+                    if 'ACCEPT' not in policy_line:
+                        cmd_set = "sudo iptables -P INPUT ACCEPT"
+                        subprocess.Popen(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
         except Exception:
             pass
 
@@ -1796,11 +1867,32 @@ class AellaCli(cmd.Cmd, object):
         if description:
             description = description.strip('"').strip("'").strip()
         
-        # Ensure local interface IPs are always allowed
+        # Get local interface IPs
+        local_ips = self._get_local_interface_ips()
+        
+        # Ensure local interface IPs are always allowed (destination-based rules)
         self._ensure_local_ip_allow_rules()
         
-        # Ensure default policy is ACCEPT if no ACL rules
+        # Ensure default policy is ACCEPT if no user-defined ACL rules
         self._ensure_default_accept_policy()
+        
+        # For deny rules, check if source IP matches any local interface IP
+        # If so, skip adding the deny rule (local IPs should never be blocked)
+        if action == 'deny':
+            if source in local_ips:
+                print('Cannot deny traffic from/to local interface IP: {} (always allowed)\n'.format(source))
+                return
+            # Also check if source is a network that includes local IPs
+            if '/' in source:
+                # Check if any local IP is in the specified network
+                for local_ip in local_ips:
+                    # Simple check: if local IP starts with network prefix
+                    network_base = source.split('/')[0]
+                    network_prefix = network_base.rsplit('.', 1)[0] if '.' in network_base else network_base
+                    local_ip_prefix = local_ip.rsplit('.', 1)[0] if '.' in local_ip else local_ip
+                    if network_prefix == local_ip_prefix:
+                        print('Warning: Network {} may include local interface IPs. Deny rule may not block local IP traffic.\n'.format(source))
+                        break
         
         try:
             # Build iptables rules with comment
@@ -1818,6 +1910,9 @@ class AellaCli(cmd.Cmd, object):
                         cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
                     else:
+                        # For deny rules: ensure local IP destination traffic is never blocked
+                        # Local IP destination rules are already added by _ensure_local_ip_allow_rules()
+                        # and will match before this deny rule, so local IP traffic is protected
                         cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
                 else:
@@ -1836,6 +1931,9 @@ class AellaCli(cmd.Cmd, object):
                         cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port_num, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
                     else:
+                        # For deny rules: ensure local IP destination traffic is never blocked
+                        # Local IP destination rules are already added by _ensure_local_ip_allow_rules()
+                        # and will match before this deny rule, so local IP traffic is protected
                         cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port_num, comment_part).strip()
                         check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
                 

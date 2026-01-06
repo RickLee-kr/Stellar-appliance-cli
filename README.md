@@ -1,197 +1,200 @@
 # Stellar Appliance CLI
 
-Stellar Cyber Appliance를 위한 명령줄 인터페이스(CLI) 도구입니다. KVM 호스트의 네트워크 설정, NTP 설정, 방화벽 규칙 등을 관리할 수 있습니다.
+A command-line interface (CLI) tool for Stellar Cyber Appliance. It allows you to manage network settings, NTP configuration, firewall rules, and more on KVM hosts.
 
-## 목적
+## Purpose
 
-이 CLI 도구는 Stellar Cyber Appliance 환경에서 다음을 수행하기 위해 개발되었습니다:
+This CLI tool was developed to perform the following tasks in Stellar Cyber Appliance environments:
 
-- **네트워크 설정 관리**: IP 주소, Gateway, DNS 서버 설정
-- **NTP 설정 관리**: 다양한 NTP 구현체 지원 (ntpsec, chrony, systemd-timesyncd)
-- **방화벽 규칙 관리**: iptables를 사용한 Access Control List (ACL) 관리
-- **시스템 정보 조회**: 호스트명, 서비스 상태, 라우팅 테이블 등
-- **시스템 설정**: 타임존, 시간, 패치 관리 등
+- **Network Configuration Management**: IP address, Gateway, and DNS server configuration
+- **NTP Configuration Management**: Support for various NTP implementations (ntpsec, chrony, systemd-timesyncd)
+- **Firewall Rule Management**: Access Control List (ACL) management using iptables
+- **System Information Query**: Hostname, service status, routing tables, etc.
+- **System Configuration**: Timezone, time, patch management, etc.
 
-## 주요 기능
+## Key Features
 
-### 1. 네트워크 설정 관리
+### 1. Network Configuration Management
 
-#### 인터페이스 정보 조회 및 설정
+#### Interface Information Display and Configuration
 ```bash
-show interface              # 모든 네트워크 인터페이스 정보 표시
-set interface <interface> ip <IP> <netmask> [gateway]  # IP 주소 설정
-set interface <interface> gateway <gateway>            # Gateway 설정
-set interface <interface> dns <dns1> [dns2 ...]        # DNS 서버 설정
-unset interface <interface>                            # 인터페이스 설정 제거
+show interface              # Display all network interface information
+set interface <interface> ip <IP> <netmask> [gateway]  # Set IP address
+set interface <interface> gateway <gateway>            # Set Gateway
+set interface <interface> dns <dns1> [dns2 ...]        # Set DNS servers
+unset interface <interface>                            # Remove interface configuration
 ```
 
-#### DNS 서버 조회 및 설정
+#### DNS Server Display and Configuration
 ```bash
-show dns                   # 현재 설정된 DNS 서버 표시
-set dns <interface> <dns1> [dns2 ...]  # DNS 서버 설정
+show dns                   # Display currently configured DNS servers
+set dns <interface> <dns1> [dns2 ...]  # Set DNS servers
 ```
 
-#### Gateway 조회
+#### Gateway Display
 ```bash
-show gateway               # 기본 Gateway 정보 표시
+show gateway               # Display default Gateway information
 ```
 
-### 2. NTP 설정 관리
+### 2. NTP Configuration Management
 
-다양한 NTP 구현체를 자동으로 감지하고 지원합니다:
+Automatically detects and supports various NTP implementations:
 - **ntpsec**: `/etc/ntpsec/ntp.conf`
 - **chrony**: `/etc/chrony/chrony.conf`
 - **systemd-timesyncd**: `/etc/systemd/timesyncd.conf`
 - **legacy ntp**: `/etc/ntp.conf`
 
 ```bash
-show ntp                   # 현재 NTP 설정 및 서버 정보 표시
-set ntp <server>           # NTP 서버 추가
-unset ntp <server>         # NTP 서버 제거
+show ntp                   # Display current NTP configuration and server information
+set ntp <server>           # Add NTP server
+unset ntp <server>         # Remove NTP server
 ```
 
-**특징:**
-- 설치 스크립트가 설정한 NTP 구성을 자동으로 인식
-- 활성 NTP 서비스를 자동 감지
-- NTP 서비스 자동 재시작
+**Features:**
+- Automatically recognizes NTP configurations set by installer scripts
+- Automatically detects active NTP service
+- Automatically restarts NTP service
 
-### 3. Access Control List (ACL) 관리
+### 3. Access Control List (ACL) Management
 
-iptables를 사용한 방화벽 규칙 관리:
+Firewall rule management using iptables:
 
 ```bash
-show acl                   # 현재 iptables INPUT 체인 규칙 표시
-set acl allow <IP/network> <port> [port2 ...] | all [description]  # 허용 규칙 추가
-set acl deny <IP/network> <port> [port2 ...] | all [description]   # 거부 규칙 추가
-unset acl <IP/network> <port> [port2 ...] | all                    # 규칙 제거
+show acl                   # Display current iptables INPUT chain rules
+set acl allow <IP/network> <port> [port2 ...] | all [description]  # Add allow rule
+set acl deny <IP/network> <port> [port2 ...] | all [description]   # Add deny rule
+unset acl <IP/network> <port> [port2 ...] | all                    # Remove rule
 ```
 
-**예시:**
+**Examples:**
 ```bash
-# 단일 IP의 특정 포트 허용
+# Allow specific port for single IP
 set acl allow 192.168.1.100 22 "Admin SSH access"
 
-# 네트워크의 여러 포트 허용
+# Allow multiple ports for network
 set acl allow 192.168.1.0/24 80 443 "Web servers"
 
-# 네트워크의 모든 포트 허용
+# Allow all ports for network
 set acl allow 10.0.0.0/8 all "Internal network"
 
-# 규칙 제거
+# Remove rule
 unset acl 192.168.1.100 22
 ```
 
-**특징:**
-- IP 주소 또는 CIDR 네트워크 지원 (예: `192.168.1.0/24`)
-- 단일 포트, 여러 포트, 또는 모든 포트 지원
-- 각 규칙에 설명(description) 추가 가능
-- `show acl` 명령으로 설명과 함께 규칙 확인 가능
+**Features:**
+- Supports IP addresses or CIDR networks (e.g., `192.168.1.0/24`)
+- Supports single port, multiple ports, or all ports
+- Optional description/comment for each rule
+- View rules with descriptions using `show acl` command
+- Local interface IPs (e.g., 192.168.0.100) are always allowed and cannot be blocked
+- Default policy is ACCEPT when no user-defined ACL rules are configured
+- Local interface IP rules are hidden from `show acl` output and cannot be removed
 
-### 4. 시스템 정보 조회
-
-```bash
-show version               # 시스템 정보 표시
-show hostname              # 호스트명 표시
-show service               # 서비스 상태 표시
-show timezone              # 타임존 정보 표시
-show time                  # 시스템 시간 표시
-show route                 # 라우팅 테이블 표시
-```
-
-### 5. 시스템 설정
+### 4. System Information Display
 
 ```bash
-set timezone <timezone>    # 타임존 설정
-set time <YYYY-MM-DD HH:MM:SS>  # 시스템 시간 설정
-set hostname <hostname>    # 호스트명 설정
-set password               # 관리자 비밀번호 변경
+show version               # Display system information
+show hostname              # Display hostname
+show service               # Display service status
+show timezone              # Display timezone information
+show time                  # Display system time
+show route                 # Display routing table
 ```
 
-### 6. 서비스 관리
+### 5. System Configuration
 
 ```bash
-start <service>            # 서비스 시작
-restart <service>          # 서비스 재시작
-shutdown <service>         # 서비스 종료
+set timezone <timezone>    # Set timezone
+set time <YYYY-MM-DD HH:MM:SS>  # Set system time
+set hostname <hostname>    # Set hostname
+set password               # Change administrator password
 ```
 
-### 7. 기타 기능
+### 6. Service Management
 
 ```bash
-show autostart             # VM 자동 시작 설정 조회
-set autostart <vm> <on|off>  # VM 자동 시작 설정
-show patch_history         # 패치 적용 이력 조회
-set patches <patch_file>   # 패치 적용
-monitor                    # VM 리소스 및 시스템 상태 모니터링
+start <service>            # Start service
+restart <service>         # Restart service
+shutdown <service>         # Shutdown service
 ```
 
-## 설치 방법
+### 7. Other Features
 
-### 요구사항
+```bash
+show autostart             # Display VM auto-start configuration
+set autostart <vm> <on|off>  # Configure VM auto-start
+show patch_history         # Display patch application history
+set patches <patch_file>   # Apply patches
+monitor                    # Monitor VM resources and system status
+```
 
-- Python 3.10 이상
-- Linux 환경 (Ubuntu 16.04 이상 권장)
-- sudo 권한
+## Installation
 
-### 설치
+### Requirements
 
-1. 저장소 클론:
+- Python 3.10 or higher
+- Linux environment (Ubuntu 16.04 or higher recommended)
+- sudo privileges
+
+### Installation Steps
+
+1. Clone the repository:
 ```bash
 git clone https://github.com/RickLee-kr/Stellar-appliance-cli.git
 cd Stellar-appliance-cli
 ```
 
-2. 가상 환경 생성 및 활성화 (권장):
+2. Create and activate virtual environment (recommended):
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-3. 패키지 설치:
+3. Install the package:
 ```bash
 pip install -e .
 ```
 
-## 사용 방법
+## Usage
 
-CLI를 실행합니다:
+Run the CLI:
 ```bash
 aella_cli
 ```
 
-또는 Python 모듈로 직접 실행:
+Or run directly as a Python module:
 ```bash
 python -m dp_cli.aella_cli_aio_appliance
 ```
 
-### 명령어 구조
+### Command Structure
 
-CLI는 다음과 같은 명령어 구조를 사용합니다:
+The CLI uses the following command structure:
 
 ```
 <command> <subcommand> [parameters]
 ```
 
-주요 명령어:
-- `show <item>`: 정보 조회
-- `set <item> <parameters>`: 설정 변경
-- `unset <item> <parameters>`: 설정 제거
-- `start <service>`: 서비스 시작
-- `restart <service>`: 서비스 재시작
-- `shutdown <service>`: 서비스 종료
+Main commands:
+- `show <item>`: Display information
+- `set <item> <parameters>`: Change configuration
+- `unset <item> <parameters>`: Remove configuration
+- `start <service>`: Start service
+- `restart <service>`: Restart service
+- `shutdown <service>`: Shutdown service
 
-### 도움말
+### Help
 
 ```bash
-help                    # 전체 명령어 목록
-help <command>          # 특정 명령어 도움말
-show <item> ?           # 특정 항목의 사용법
-set <item> ?            # 설정 명령어 사용법
+help                    # List all commands
+help <command>          # Show help for specific command
+show <item> ?           # Show usage for specific item
+set <item> ?            # Show usage for set command
 ```
 
-## 지원되는 설치 스크립트
+## Supported Installer Scripts
 
-이 CLI는 다음 설치 스크립트와 호환됩니다:
+This CLI is compatible with the following installer scripts:
 
 - Ubuntu 16.04 base DP installer
 - Ubuntu 24.04 base DP Installer
@@ -199,59 +202,64 @@ set <item> ?            # 설정 명령어 사용법
 - xdr-sensor-installer
 - xdr-6000-sensor-installer
 
-설치 스크립트가 설정한 네트워크 구성, NTP 설정 등을 자동으로 인식하고 관리할 수 있습니다.
+The CLI can automatically recognize and manage network configurations and NTP settings set by these installer scripts.
 
-## 네트워크 설정 파일 구조
+## Network Configuration File Structure
 
-CLI는 다음 파일들을 관리합니다:
+The CLI manages the following files:
 
-- `/etc/network/interfaces`: 메인 네트워크 인터페이스 설정
-- `/etc/network/interfaces.d/*.cfg`: 인터페이스별 설정 파일
+- `/etc/network/interfaces`: Main network interface configuration
+- `/etc/network/interfaces.d/*.cfg`: Per-interface configuration files
 
-## NTP 설정 파일
+## NTP Configuration Files
 
-CLI는 다음 NTP 설정 파일을 지원합니다:
+The CLI supports the following NTP configuration files:
 
-- `/etc/ntpsec/ntp.conf`: ntpsec 설정
-- `/etc/chrony/chrony.conf`: chrony 설정
-- `/etc/systemd/timesyncd.conf`: systemd-timesyncd 설정
-- `/etc/ntp.conf`: legacy ntp 설정
+- `/etc/ntpsec/ntp.conf`: ntpsec configuration
+- `/etc/chrony/chrony.conf`: chrony configuration
+- `/etc/systemd/timesyncd.conf`: systemd-timesyncd configuration
+- `/etc/ntp.conf`: legacy ntp configuration
 
-## ACL (iptables) 규칙
+## ACL (iptables) Rules
 
-ACL 규칙은 iptables의 INPUT 체인에 추가됩니다. 규칙을 영구적으로 저장하려면 다음 명령어를 사용하세요:
+ACL rules are added to the iptables INPUT chain. To make rules persistent, use the following commands:
 
 ```bash
 sudo iptables-save > /etc/iptables/rules.v4
 ```
 
-또는 Ubuntu의 경우:
+Or for Ubuntu:
 ```bash
 sudo netfilter-persistent save
 ```
 
-## 주의사항
+## Important Notes
 
-- 네트워크 설정 변경 후에는 인터페이스를 재시작해야 적용됩니다:
+- After changing network settings, you must restart the interface for changes to take effect:
   ```bash
   set interface <interface> restart
   ```
 
-- NTP 설정 변경 시 해당 NTP 서비스가 자동으로 재시작됩니다.
+- NTP service is automatically restarted when NTP configuration is changed.
 
-- ACL 규칙은 즉시 적용되지만, 시스템 재부팅 후에도 유지하려면 iptables 규칙을 저장해야 합니다.
+- ACL rules are applied immediately, but you must save iptables rules to persist them after system reboot.
 
-- 일부 명령어는 `sudo` 권한이 필요할 수 있습니다.
+- Some commands may require `sudo` privileges.
 
-## 라이선스
+- Local interface IPs (e.g., 192.168.0.100) are always allowed regardless of ACL deny rules. Traffic to local interface IPs cannot be blocked.
+
+- When no user-defined ACL rules are configured, the default policy is ACCEPT (all traffic allowed).
+
+- Local interface IP rules are hidden from `show acl` output and cannot be removed using `unset acl`.
+
+## License
 
 Copyright (c) 2026, Stellar Cyber Inc.
 
-## 기여
+## Contributing
 
-이슈 리포트나 기능 제안은 GitHub Issues를 통해 제출해주세요.
+Please submit issue reports or feature suggestions through GitHub Issues.
 
-## 관련 프로젝트
+## Related Projects
 
-- [OpenXDR KVM Installer](https://github.com/RickLee-kr/OpenXDR-KVM-Installer): KVM 호스트 설치 스크립트
-
+- [OpenXDR KVM Installer](https://github.com/RickLee-kr/OpenXDR-KVM-Installer): KVM host installation scripts
