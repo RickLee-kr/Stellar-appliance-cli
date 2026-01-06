@@ -816,10 +816,32 @@ class AellaCli(cmd.Cmd, object):
     def show_acl_callback(self, key, param):
         """Show current iptables ACL rules with descriptions"""
         try:
+            # Ensure local interface IPs are always allowed
+            self._ensure_local_ip_allow_rules()
+            
+            # Ensure default policy is ACCEPT if no ACL rules
+            self._ensure_default_accept_policy()
+            
             output = "\n"
             output += "=" * 95 + "\n"
             output += "Access Control List (iptables INPUT chain rules)\n"
             output += "=" * 95 + "\n"
+            
+            # Get default policy
+            cmd_policy = "sudo iptables -L INPUT -n | head -1"
+            proc_policy = subprocess.Popen(cmd_policy, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_policy, _ = proc_policy.communicate()
+            if out_policy:
+                policy_line = out_policy.decode('utf-8', errors='ignore').strip()
+                if 'policy' in policy_line.lower():
+                    output += "Default Policy: {}\n".format(policy_line)
+                    output += "\n"
+            
+            # Get local interface IPs
+            local_ips = self._get_local_interface_ips()
+            if local_ips:
+                output += "Local Interface IPs (always allowed): {}\n".format(', '.join(local_ips))
+                output += "\n"
             
             # Get iptables rules for INPUT chain
             # iptables -L automatically shows comments if comment module is used
@@ -1589,6 +1611,117 @@ class AellaCli(cmd.Cmd, object):
         self.set_interface_callback2([interface, 'dns'] + dns_servers)
         print("DNS servers configured for interface {}. Run 'set interface {} restart' to apply.\n".format(interface, interface))
 
+    def _get_local_interface_ips(self):
+        """Get all local interface IP addresses"""
+        local_ips = []
+        try:
+            # Get IP addresses from ip command
+            cmd = "ip -4 addr show | grep -oP 'inet \K[\d.]+'"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, _ = proc.communicate()
+            if out:
+                local_ips = out.decode('utf-8', errors='ignore').strip().split('\n')
+                local_ips = [ip.strip() for ip in local_ips if ip.strip()]
+        except Exception:
+            pass
+        
+        # Also check /etc/network/interfaces and interfaces.d/*.cfg
+        try:
+            interfaces_file = "/etc/network/interfaces"
+            if os.path.exists(interfaces_file):
+                with open(interfaces_file, 'r') as f:
+                    for line in f:
+                        match = re.match(r'^\s*address\s+(\S+)', line)
+                        if match:
+                            ip = match.group(1)
+                            if self.valid_ipv4_address(ip) and ip not in local_ips:
+                                local_ips.append(ip)
+        except Exception:
+            pass
+        
+        try:
+            interfaces_d_dir = "/etc/network/interfaces.d"
+            if os.path.exists(interfaces_d_dir):
+                for filename in os.listdir(interfaces_d_dir):
+                    if filename.endswith('.cfg'):
+                        filepath = os.path.join(interfaces_d_dir, filename)
+                        try:
+                            with open(filepath, 'r') as f:
+                                for line in f:
+                                    match = re.match(r'^\s*address\s+(\S+)', line)
+                                    if match:
+                                        ip = match.group(1)
+                                        if self.valid_ipv4_address(ip) and ip not in local_ips:
+                                            local_ips.append(ip)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        
+        return local_ips
+
+    def _ensure_local_ip_allow_rules(self):
+        """Ensure local interface IPs are always allowed"""
+        local_ips = self._get_local_interface_ips()
+        for local_ip in local_ips:
+            # Check if rule exists for this local IP
+            cmd_check = "sudo iptables -C INPUT -d {} -j ACCEPT".format(local_ip)
+            proc = subprocess.Popen(cmd_check, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc.communicate()
+            
+            if proc.returncode != 0:
+                # Rule doesn't exist, add it at the beginning
+                cmd_add = "sudo iptables -I INPUT 1 -d {} -m comment --comment 'Local interface IP - always allow' -j ACCEPT".format(local_ip)
+                proc_add = subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                proc_add.communicate()
+                # If comment module not available, try without comment
+                if proc_add.returncode != 0:
+                    cmd_add_no_comment = "sudo iptables -I INPUT 1 -d {} -j ACCEPT".format(local_ip)
+                    subprocess.Popen(cmd_add_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+    def _ensure_default_accept_policy(self):
+        """Ensure default INPUT chain policy is ACCEPT if no user-defined ACL rules exist"""
+        try:
+            # Check current policy
+            cmd = "sudo iptables -L INPUT -n | head -1"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, _ = proc.communicate()
+            
+            if out:
+                policy_line = out.decode('utf-8', errors='ignore')
+                # Check if policy is DROP or REJECT
+                if 'DROP' in policy_line or 'REJECT' in policy_line:
+                    # Count user-defined ACL rules (excluding local IP allow rules)
+                    # Get all rules and filter out local IP rules
+                    cmd_list = "sudo iptables -L INPUT -n --line-numbers"
+                    proc_list = subprocess.Popen(cmd_list, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out_list, _ = proc_list.communicate()
+                    
+                    if out_list:
+                        lines = out_list.decode('utf-8', errors='ignore').split('\n')
+                        user_rule_count = 0
+                        local_ips = self._get_local_interface_ips()
+                        
+                        for line in lines:
+                            # Skip chain header and policy line
+                            if 'Chain' in line or 'policy' in line.lower() or not line.strip():
+                                continue
+                            # Skip local IP allow rules
+                            is_local_rule = False
+                            for local_ip in local_ips:
+                                if '-d {}'.format(local_ip) in line and 'ACCEPT' in line:
+                                    is_local_rule = True
+                                    break
+                            if not is_local_rule:
+                                user_rule_count += 1
+                        
+                        # If no user-defined rules exist, set policy to ACCEPT
+                        if user_rule_count == 0:
+                            cmd_set = "sudo iptables -P INPUT ACCEPT"
+                            subprocess.Popen(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        except Exception:
+            pass
+
     def set_acl_callback(self, key, param):
         """Configure iptables ACL rules
         Usage: set acl allow <IP/network> <port> [port2 ...] | all [description]
@@ -1662,6 +1795,12 @@ class AellaCli(cmd.Cmd, object):
         # Clean up description (remove quotes)
         if description:
             description = description.strip('"').strip("'").strip()
+        
+        # Ensure local interface IPs are always allowed
+        self._ensure_local_ip_allow_rules()
+        
+        # Ensure default policy is ACCEPT if no ACL rules
+        self._ensure_default_accept_policy()
         
         try:
             # Build iptables rules with comment
@@ -1831,6 +1970,7 @@ class AellaCli(cmd.Cmd, object):
             print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
             print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
             print('  Multiple ports can be specified separated by space')
+            print('  Note: Local interface IP rules cannot be removed')
             print('\nExamples:')
             print('  unset acl 192.168.1.100 22')
             print('  unset acl 192.168.1.0/24 80 443')
@@ -1851,6 +1991,12 @@ class AellaCli(cmd.Cmd, object):
                 print('Invalid IP address format: {}\n'.format(source))
                 return
         
+        # Check if trying to remove local interface IP rule
+        local_ips = self._get_local_interface_ips()
+        if source in local_ips:
+            print('Cannot remove local interface IP rule: {} (always allowed)\n'.format(source))
+            return
+        
         ports = param[1:]
         if not ports:
             print('Port specification required\n')
@@ -1869,14 +2015,29 @@ class AellaCli(cmd.Cmd, object):
             for port in ports:
                 if port == 'all':
                     # Remove all rules for this source (both ACCEPT and DROP, all ports)
-                    # Get all rules matching the source
-                    cmd = "sudo iptables -L INPUT -n --line-numbers | grep -E '^[0-9]+.*{}' | awk '{{print $1}}'".format(source)
+                    # Get all rules matching the source, but exclude local IP rules
+                    cmd = "sudo iptables -L INPUT -n --line-numbers"
                     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     out, err = proc.communicate()
                     if out:
-                        line_nums = out.decode('utf-8', errors='ignore').strip().split('\n')
+                        lines = out.decode('utf-8', errors='ignore').split('\n')
+                        line_nums_to_remove = []
+                        for line in lines:
+                            if re.match(r'^\s*(\d+)', line):
+                                line_num = re.match(r'^\s*(\d+)', line).group(1)
+                                # Check if this line matches the source and is not a local IP rule
+                                if source in line:
+                                    # Check if it's a local IP rule (destination rule)
+                                    is_local_rule = False
+                                    for local_ip in local_ips:
+                                        if '-d {}'.format(local_ip) in line:
+                                            is_local_rule = True
+                                            break
+                                    if not is_local_rule:
+                                        line_nums_to_remove.append(line_num)
+                        
                         # Remove in reverse order to maintain line numbers
-                        for line_num in reversed(line_nums):
+                        for line_num in reversed(line_nums_to_remove):
                             if line_num.isdigit():
                                 del_cmd = "sudo iptables -D INPUT {}".format(line_num)
                                 del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1909,6 +2070,9 @@ class AellaCli(cmd.Cmd, object):
                 print('Successfully removed ACL rules:\n')
                 for source, port in rules_removed:
                     print('  {} {}\n'.format(source, port))
+                
+                # Ensure default policy is ACCEPT if no user-defined rules remain
+                self._ensure_default_accept_policy()
             else:
                 print('No matching ACL rules found to remove.\n')
                 print('Use "show acl" to see current rules.\n')
