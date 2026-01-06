@@ -83,7 +83,7 @@ def ensure_file(file_path, root=False, owner=None):
             )
         else:
             file_path_obj.touch(exist_ok=True)
-            proc = subprocess.CompletedProcess([], 0)
+            proc = subprocess.CompletedProcess([], 0, "", "")
     except PermissionError:
         proc = subprocess.run(
             ["sudo", "touch", str(file_path_obj)],
