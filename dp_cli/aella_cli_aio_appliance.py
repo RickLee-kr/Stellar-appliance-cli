@@ -8,6 +8,10 @@ Date: 2026-01-01
 
 """
 
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Sequence, Optional
+
 import datetime
 import getpass
 import json
@@ -42,17 +46,34 @@ PATCH_LOG_DIR = "{}/logs".format(PATCH_DIR)
 PATCH_HISTORY = "{}/hotfix-history".format(PATCH_DIR)
 
 
-# Implemented the check_output to support python 2.6
-def check_output(*popenargs, **kwargs):
-    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-    output, unused_err = process.communicate().decode()
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        raise subprocess.CalledProcessError(retcode, cmd, output=output)
-    return output
+@dataclass(frozen=True)
+class CmdResult:
+    args: Sequence[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def run_cmd(args: Sequence[str], *, check: bool = True, timeout: Optional[int] = None) -> CmdResult:
+    proc = subprocess.run(
+        list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, list(args),
+            output=proc.stdout, stderr=proc.stderr
+        )
+    return CmdResult(
+        args=list(args),
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
 
 
 class AellaCli(cmd.Cmd, object):
@@ -238,11 +259,8 @@ class AellaCli(cmd.Cmd, object):
     @staticmethod
     def get_da_name():
         try:
-            retcode = subprocess.call('virsh dominfo da-master > /dev/null 2>&1', shell=True)
-            if retcode:
-                return 'dr-master'
-            else:
-                return 'da-master'
+            rc = run_cmd(["virsh", "dominfo", "da-master"], check=False).returncode
+            return "da-master" if rc == 0 else "dr-master"
         except Exception:
             return 'dr-master'
 
@@ -251,11 +269,9 @@ class AellaCli(cmd.Cmd, object):
         """Get list of all VMs from virsh list --all"""
         vm_list = []
         try:
-            cmd = "virsh list --all --name 2>/dev/null"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-            if out:
-                vm_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
+            result = run_cmd(["virsh", "list", "--all", "--name"], check=False)
+            if result.stdout:
+                vm_list = [vm.strip() for vm in result.stdout.split('\n') if vm.strip()]
         except Exception:
             pass
         return vm_list
