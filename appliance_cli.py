@@ -2782,23 +2782,13 @@ class AellaCli(cmd.Cmd, object):
             except Exception:
                 mem_total_gb = 0
             
-            # Print header with explanations
-            print('\n' + '=' * 95)
+            # Print header
+            print('\n' + '=' * 140)
             print('VM Resource Usage Monitor')
-            print('=' * 95)
-            print('CPU%: CPU usage percentage (from top command, can exceed 100% for multi-threaded processes)')
-            print('      For multi-threaded processes, this is the sum of all thread CPU usage')
-            print('      Example: 200% = equivalent to 2 CPU cores fully utilized')
-            print('      Note: High CPU% may not reflect actual system load if threads are waiting')
-            print('RSS:  Resident Set Size - actual physical memory used by the VM process (MB)')
-            print('Mem%: Memory usage percentage (RSS / allocated memory)')
-            print('      May exceed 100% in overcommit scenarios (RSS > allocated)')
-            print('      High Mem% is normal as memory is pre-allocated to VMs')
-            print('Status: OK=Normal, WARN=High usage, CRIT=Critical')
-            print('-' * 95)
-            print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
-                'VM', 'PID', 'CPU%', 'RSS(MB)', 'Mem%', 'Cores', 'Status'))
-            print('-' * 95)
+            print('=' * 140)
+            print('{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}'.format(
+                'VM', 'PID', 'CPU(top%)', 'CPU(host%)', 'CPU(vcpu%)', 'RSS(GB)', 'Mem(host%)', 'Mem(alloc%)', 'Alloc(GB)', 'vCPU', 'Status'))
+            print('-' * 140)
             
             # For each VM, get detailed resource usage
             for vm in vm_list:
@@ -2861,7 +2851,7 @@ class AellaCli(cmd.Cmd, object):
                     
                     if rss_kb > 0:
                         rss_mb = rss_kb / 1024.0
-                        rss_gb = rss_mb / 1024.0
+                        rss_gb = rss_kb / 1024.0 / 1024.0
                         
                         # Get VM memory allocation from virsh (use "Memory" field which is current allocation, not "Max memory")
                         try:
@@ -2872,11 +2862,6 @@ class AellaCli(cmd.Cmd, object):
                             if out:
                                 allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
                                 allocated_mem_mb = allocated_mem_kb / 1024.0
-                                # Calculate memory usage percentage
-                                if allocated_mem_mb > 0:
-                                    mem_percent = (rss_mb / allocated_mem_mb * 100)
-                                else:
-                                    mem_percent = 0
                             else:
                                 # Fallback to "Max memory" if "Memory" not available
                                 cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
@@ -2885,16 +2870,10 @@ class AellaCli(cmd.Cmd, object):
                                 if out:
                                     allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
                                     allocated_mem_mb = allocated_mem_kb / 1024.0
-                                    if allocated_mem_mb > 0:
-                                        mem_percent = (rss_mb / allocated_mem_mb * 100)
-                                    else:
-                                        mem_percent = 0
                                 else:
                                     allocated_mem_mb = 0
-                                    mem_percent = 0
                         except Exception:
                             allocated_mem_mb = 0
-                            mem_percent = 0
                         
                         # Get CPU allocation (vCPUs)
                         try:
@@ -2908,36 +2887,39 @@ class AellaCli(cmd.Cmd, object):
                         except Exception:
                             vcpus = threads
                         
-                        # Determine status based on thresholds
+                        # Calculate normalized values
+                        cpu_host_percent = cpu_percent / total_cores if total_cores > 0 else 0
+                        cpu_vcpu_percent = cpu_percent / vcpus if vcpus > 0 else 0
+                        mem_host_percent = (rss_kb / mem_total_kb) * 100 if mem_total_kb > 0 else 0
+                        alloc_gb = allocated_mem_mb / 1024.0 if allocated_mem_mb > 0 else 0
+                        mem_alloc_percent = (rss_mb / allocated_mem_mb) * 100 if allocated_mem_mb > 0 else 0
+                        
+                        # Determine status based on host thresholds
                         status = 'OK'
-                        # CPU%: top shows CPU usage percentage (can exceed 100% for multi-threaded processes)
-                        # For multi-threaded processes, this represents sum of all thread CPU usage
-                        # Calculate average per core for threshold comparison
-                        cpu_per_core = cpu_percent / total_cores if total_cores > 0 else cpu_percent
-                        if cpu_per_core > 80:  # Average > 80% per core
+                        # CPU(host%): > 80 CRIT, > 50 WARN
+                        if cpu_host_percent > 80:
                             status = 'CRIT'
-                        elif cpu_per_core > 50:
+                        elif cpu_host_percent > 50:
                             status = 'WARN'
                         
-                        # Mem%: RSS / allocated memory
-                        if mem_percent > 90:
+                        # Mem(host%): > 90 CRIT, > 75 WARN
+                        if mem_host_percent > 90:
                             status = 'CRIT' if status != 'CRIT' else 'CRIT'
-                        elif mem_percent > 75:
+                        elif mem_host_percent > 75:
                             status = 'WARN' if status == 'OK' else status
                         
                         # Format output
-                        cpu_str = '{:.1f}'.format(cpu_percent)
-                        rss_str = '{:.1f}'.format(rss_mb)
-                        # Show actual percentage (can exceed 100% in overcommit scenarios)
-                        if allocated_mem_mb > 0:
-                            mem_str = '{:.1f}%'.format(mem_percent)
-                            if mem_percent > 100:
-                                mem_str += ' (overcommit)'
-                        else:
-                            mem_str = 'N/A'
+                        cpu_top_str = '{:.1f}'.format(cpu_percent)
+                        cpu_host_str = '{:.1f}'.format(cpu_host_percent)
+                        cpu_vcpu_str = '{:.1f}'.format(cpu_vcpu_percent)
+                        rss_gb_str = '{:.2f}'.format(rss_gb)
+                        mem_host_str = '{:.1f}'.format(mem_host_percent)
+                        mem_alloc_str = '{:.1f}'.format(mem_alloc_percent) if allocated_mem_mb > 0 else 'N/A'
+                        alloc_gb_str = '{:.2f}'.format(alloc_gb) if allocated_mem_mb > 0 else 'N/A'
                         
-                        print('{:<15} {:<8} {:<10} {:<12} {:<12} {:<10} {:<8}'.format(
-                            vm, pid, cpu_str, rss_str, mem_str, vcpus, status))
+                        print('{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}'.format(
+                            vm, pid, cpu_top_str, cpu_host_str, cpu_vcpu_str, rss_gb_str, 
+                            mem_host_str, mem_alloc_str, alloc_gb_str, vcpus, status))
                     else:
                         # Skip VM if we can't get RSS
                         continue
@@ -2945,10 +2927,11 @@ class AellaCli(cmd.Cmd, object):
                     # Skip VM if we can't get its info
                     continue
             
-            print('-' * 95)
+            print('-' * 140)
             print('Legend:')
-            print('  CPU%: Average per core > 50% = WARN, > 80% = CRIT (total CPU% / {} cores)'.format(total_cores))
-            print('  Mem%: > 75% = WARN, > 90% = CRIT (based on allocated memory)')
+            print('  CPU(host%): >50 WARN, >80 CRIT (CPU(top%) / {} cores)'.format(total_cores))
+            print('  Mem(host%): >75 WARN, >90 CRIT (RSS / host MemTotal)')
+            print('  CPU(vcpu%) / Mem(alloc%): 참고용 지표 (Status 판정에는 사용하지 않음)')
             print('  Use "monitor vm htop <VM Name>" for detailed process monitoring')
             print('')
         except Exception as e:
@@ -2962,6 +2945,8 @@ class AellaCli(cmd.Cmd, object):
                 with open('/proc/loadavg', 'r') as f:
                     loadavg = f.read().strip().split()
                     load_1min = float(loadavg[0])
+                    load_5min = float(loadavg[1])
+                    load_15min = float(loadavg[2])
                 
                 # Get CPU core count
                 cmd = "nproc"
@@ -2969,10 +2954,22 @@ class AellaCli(cmd.Cmd, object):
                 out, _ = proc.communicate()
                 cpu_cores = int(out.decode('utf-8', errors='ignore').strip()) if out else 1
                 
-                if load_1min < cpu_cores:
-                    print('[OK]   load: {:.1f} (cores={})'.format(load_1min, cpu_cores))
+                # Calculate per-core load
+                per_core_1min = load_1min / cpu_cores if cpu_cores > 0 else 0
+                per_core_5min = load_5min / cpu_cores if cpu_cores > 0 else 0
+                per_core_15min = load_15min / cpu_cores if cpu_cores > 0 else 0
+                
+                # Determine status based on per-core load
+                if per_core_1min > 1.0:
+                    status = 'CRIT'
+                elif per_core_1min > 0.7:
+                    status = 'WARN'
                 else:
-                    print('[WARN] load: {:.1f} (cores={})'.format(load_1min, cpu_cores))
+                    status = 'OK'
+                
+                print('[{}]   load: {:.1f} {:.1f} {:.1f} (cores={}, per-core={:.2f} {:.2f} {:.2f})'.format(
+                    status, load_1min, load_5min, load_15min, cpu_cores, 
+                    per_core_1min, per_core_5min, per_core_15min))
             except Exception as e:
                 print('[ERR]  load: failed to check ({})'.format(e))
             
@@ -2990,10 +2987,15 @@ class AellaCli(cmd.Cmd, object):
                 
                 if mem_total > 0:
                     mem_percent = (mem_available / mem_total) * 100
+                    mem_total_gb = mem_total / (1024.0 * 1024.0)
+                    mem_available_gb = mem_available / (1024.0 * 1024.0)
+                    
                     if mem_percent > 20:
-                        print('[OK]   mem: {:.0f}% available'.format(mem_percent))
+                        print('[OK]   mem: {:.0f}% available ({:.0f}GiB / {:.0f}GiB)'.format(
+                            mem_percent, mem_available_gb, mem_total_gb))
                     else:
-                        print('[WARN] mem: {:.0f}% available'.format(mem_percent))
+                        print('[WARN] mem: {:.0f}% available ({:.0f}GiB / {:.0f}GiB)'.format(
+                            mem_percent, mem_available_gb, mem_total_gb))
                 else:
                     print('[ERR]  mem: failed to get memory info')
             except Exception as e:
@@ -3033,10 +3035,12 @@ class AellaCli(cmd.Cmd, object):
                     if len(parts) >= 5:
                         usage_str = parts[4].rstrip('%')
                         usage = int(usage_str)
+                        used = parts[2]  # Used column
+                        size = parts[1]  # Size column
                         if usage < 80:
-                            print('[OK]   /: {}% used'.format(usage))
+                            print('[OK]   /: {}% used ({} / {})'.format(usage, used, size))
                         else:
-                            print('[WARN] /: {}% used'.format(usage))
+                            print('[WARN] /: {}% used ({} / {})'.format(usage, used, size))
             except Exception as e:
                 print('[ERR]  /: failed to check ({})'.format(e))
             
@@ -3051,38 +3055,64 @@ class AellaCli(cmd.Cmd, object):
                         if len(parts) >= 5:
                             usage_str = parts[4].rstrip('%')
                             usage = int(usage_str)
+                            used = parts[2]  # Used column
+                            size = parts[1]  # Size column
                             if usage < 80:
-                                print('[OK]   /stellar: {}% used'.format(usage))
+                                print('[OK]   /stellar: {}% used ({} / {})'.format(usage, used, size))
                             else:
-                                print('[WARN] /stellar: {}% used'.format(usage))
+                                print('[WARN] /stellar: {}% used ({} / {})'.format(usage, used, size))
             except Exception as e:
                 pass  # Silently skip if /stellar doesn't exist or can't be checked
             
             # 6. libvirt service status
             try:
+                libvirt_status = None
                 # Try libvirtd first (older systems)
                 cmd = "systemctl is-active libvirtd 2>/dev/null"
                 proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, _ = proc.communicate()
                 if proc.returncode == 0 and out:
-                    status = out.decode('utf-8', errors='ignore').strip()
-                    if status == 'active':
-                        print('[OK]   libvirt: active')
-                    else:
-                        print('[WARN] libvirt: {}'.format(status))
+                    libvirt_status = out.decode('utf-8', errors='ignore').strip()
                 else:
                     # Try virtqemud (newer systems)
                     cmd = "systemctl is-active virtqemud 2>/dev/null"
                     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     out, _ = proc.communicate()
                     if proc.returncode == 0 and out:
-                        status = out.decode('utf-8', errors='ignore').strip()
-                        if status == 'active':
-                            print('[OK]   libvirt: active')
+                        libvirt_status = out.decode('utf-8', errors='ignore').strip()
+                
+                if libvirt_status:
+                    # Get VM counts
+                    running_count = 0
+                    defined_count = 0
+                    try:
+                        # Get running VMs
+                        cmd = "virsh list --name 2>/dev/null"
+                        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        out, _ = proc.communicate()
+                        if proc.returncode == 0 and out:
+                            running_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
+                            running_count = len(running_list)
+                        
+                        # Get all defined VMs
+                        cmd = "virsh list --all --name 2>/dev/null"
+                        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        out, _ = proc.communicate()
+                        if proc.returncode == 0 and out:
+                            defined_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
+                            defined_count = len(defined_list)
+                    except Exception:
+                        pass  # If VM count fails, just show service status
+                    
+                    if libvirt_status == 'active':
+                        if running_count > 0 or defined_count > 0:
+                            print('[OK]   libvirt: active (vms running {} / defined {})'.format(running_count, defined_count))
                         else:
-                            print('[WARN] libvirt: {}'.format(status))
+                            print('[OK]   libvirt: active')
                     else:
-                        print('[WARN] libvirt: service not found')
+                        print('[WARN] libvirt: {}'.format(libvirt_status))
+                else:
+                    print('[WARN] libvirt: service not found')
             except Exception as e:
                 print('[ERR]  libvirt: failed to check ({})'.format(e))
             
