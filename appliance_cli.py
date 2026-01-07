@@ -2931,7 +2931,7 @@ class AellaCli(cmd.Cmd, object):
             print('Legend:')
             print('  CPU(host%): >50 WARN, >80 CRIT (CPU(top%) / {} cores)'.format(total_cores))
             print('  Mem(host%): >75 WARN, >90 CRIT (RSS / host MemTotal)')
-            print('  CPU(vcpu%) / Mem(alloc%): 참고용 지표 (Status 판정에는 사용하지 않음)')
+            print('  CPU(vcpu%) / Mem(alloc%): Reference metrics only (not used for Status determination)')
             print('  Use "monitor vm htop <VM Name>" for detailed process monitoring')
             print('')
         except Exception as e:
