@@ -698,223 +698,198 @@ class AellaCli(cmd.Cmd, object):
     # Need to use timedatectl to get the timezone for both Ubuntu 16.04 and 24.04
     def show_tz_callback(self, key, param):
         try:
-            result = subprocess.check_output(["timedatectl"])
-            if sys.version_info[0] >= 3:  # Python 3
-                result = result.decode("utf-8")
-
-            for line in result.splitlines():
-                if "Time zone" in line:
-                    print(line.split(":")[1].split()[0].strip())
+            result = subprocess.check_output(
+                ["timedatectl", "show", "-p", "Timezone", "--value"],
+                stderr=subprocess.PIPE
+            ).decode("utf-8").strip()
+            if result:
+                print("Timezone: {}".format(result))
+            else:
+                print("Timezone: (unknown)")
         except subprocess.CalledProcessError:
             print("Failed to retrieve timezone using timedatectl")
 
     def show_time_callback(self, key, param):
         self.shell_cmd_exec('date \"+%a %Y-%m-%d %H:%M:%S %Z\"')
 
+    def _list_timezones(self) -> list[str]:
+        try:
+            out = subprocess.check_output(
+                ["timedatectl", "list-timezones"],
+                stderr=subprocess.PIPE
+            ).decode().splitlines()
+            timezones = [x.strip() for x in out if x.strip()]
+            if timezones:
+                return sorted(timezones)
+        except Exception:
+            pass
+        if ALL_TIMEZONES:
+            return sorted(ALL_TIMEZONES)
+        return []
+
+    def _read_timesyncd_ntp_servers(self, timesyncd_conf):
+        servers = []
+        if not os.path.exists(timesyncd_conf):
+            return servers
+        try:
+            with open(timesyncd_conf, 'r') as f:
+                for line in f:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith('#'):
+                        continue
+                    ntp_match = re.match(r"^NTP=(.*)", line_stripped)
+                    if ntp_match:
+                        value = ntp_match.group(1).strip()
+                        if value:
+                            servers.extend(value.split())
+                        break
+        except Exception:
+            pass
+        return servers
+
+    def _write_timesyncd_conf(self, timesyncd_conf, servers):
+        content = "[Time]\n"
+        content += "NTP={}\n".format(" ".join(servers))
+        content += "FallbackNTP=\n"
+        with open(timesyncd_conf, 'w') as f:
+            f.write(content)
+
+    def _read_ntpsec_servers(self, ntpsec_conf):
+        servers = []
+        if not os.path.exists(ntpsec_conf):
+            return servers
+        try:
+            with open(ntpsec_conf, 'r') as f:
+                for line in f:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith('#'):
+                        continue
+                    pools = re.findall(r"^pool\s+(\S+)", line)
+                    servers_found = re.findall(r"^server\s+(\S+)", line)
+                    if pools:
+                        servers.extend(pools)
+                    if servers_found:
+                        servers.extend(servers_found)
+        except Exception:
+            pass
+        return servers
+
     def show_ntp_callback(self, key, param):
         status = 0
         output = None
 
         try:
-            server_list = []
-            ntp_type = None
-            ntp_conf = None
-            service_name = None
-            
-            # 1) Check for ntpsec (DP installer format)
-            ntpsec_conf = "/etc/ntpsec/ntp.conf"
-            if os.path.exists(ntpsec_conf):
-                ntp_conf = ntpsec_conf
-                ntp_type = "ntpsec"
-                service_name = "ntpsec"
-                with open(ntpsec_conf, 'r') as f:
-                    lines = f.readlines()
-                    in_xdr_block = False
-                    for line in lines:
+            ntp_type, ntp_conf, service_name = self._detect_ntp_type()
+
+            if ntp_type == "systemd-timesyncd" or not ntp_type:
+                timesyncd_conf = "/etc/systemd/timesyncd.conf"
+                server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
+
+                output = "\n[config] {}\n".format(timesyncd_conf)
+                if server_list:
+                    output += "NTP servers: {}\n".format(" ".join(server_list))
+                else:
+                    output += "(no NTP servers configured)\n"
+
+                output += "\n[service]\n"
+                service_status = "unknown"
+                try:
+                    service_status = subprocess.check_output(
+                        ["systemctl", "is-active", "systemd-timesyncd"],
+                        stderr=subprocess.PIPE
+                    ).decode("utf-8").strip()
+                except Exception:
+                    service_status = "unknown"
+                output += "systemd-timesyncd: {}\n".format(service_status)
+
+                output += "\n[timedatectl timesync-status]\n"
+                server = "unknown"
+                stratum = "unknown"
+                offset = "unknown"
+                try:
+                    out = subprocess.check_output(
+                        ["timedatectl", "timesync-status"],
+                        stderr=subprocess.PIPE, timeout=5
+                    ).decode("utf-8").strip()
+                    for line in out.splitlines():
                         line_stripped = line.strip()
-                        # Check for XDR_NTPSEC_CONFIG block markers
-                        if "# XDR_NTPSEC_CONFIG_BEGIN" in line:
-                            in_xdr_block = True
-                            continue
-                        if "# XDR_NTPSEC_CONFIG_END" in line:
-                            in_xdr_block = False
-                            continue
-                        
-                        # Skip commented lines (unless in XDR block, where we want all)
-                        if line_stripped.startswith('#'):
-                            continue
-                        
-                        # Match pool and server lines (not commented)
-                        pools = re.findall(r"^pool\s+(\S+)", line)
-                        servers = re.findall(r"^server\s+(\S+)", line)
-                        if pools:
-                            server_list.extend(pools)
-                        if servers:
-                            server_list.extend(servers)
-            
-            # 2) Check for chrony (Ubuntu 24.04 default alternative)
-            if not server_list:
-                chrony_conf = "/etc/chrony/chrony.conf"
-                if not os.path.exists(chrony_conf):
-                    chrony_conf = "/etc/chrony.conf"
-                if os.path.exists(chrony_conf):
-                    ntp_conf = chrony_conf
-                    ntp_type = "chrony"
-                    service_name = "chronyd"
-                    with open(chrony_conf, 'r') as f:
-                        lines = f.readlines()
-                        for line in lines:
+                        if line_stripped.startswith("Server:"):
+                            server = line_stripped.split(":", 1)[1].strip()
+                        elif line_stripped.startswith("Stratum:"):
+                            stratum = line_stripped.split(":", 1)[1].strip()
+                        elif line_stripped.startswith("Offset:"):
+                            offset = line_stripped.split(":", 1)[1].strip()
+                except subprocess.TimeoutExpired:
+                    output += "Server: (timeout)\n"
+                    output += "Stratum: (timeout)\n"
+                    output += "Offset: (timeout)\n"
+                    print(output)
+                    return status, output
+                except Exception:
+                    output += "Server: (failed)\n"
+                    output += "Stratum: (failed)\n"
+                    output += "Offset: (failed)\n"
+                    print(output)
+                    return status, output
+
+                output += "Server: {}\n".format(server)
+                output += "Stratum: {}\n".format(stratum)
+                output += "Offset: {}\n".format(offset)
+
+                print(output)
+                return status, output
+
+            server_list = []
+            if ntp_type == "ntpsec" and ntp_conf:
+                server_list = self._read_ntpsec_servers(ntp_conf)
+            elif ntp_conf:
+                try:
+                    with open(ntp_conf, 'r') as f:
+                        for line in f:
                             line_stripped = line.strip()
-                            # Skip commented lines
                             if line_stripped.startswith('#') or line_stripped.startswith('%'):
                                 continue
-                            # Match pool and server lines
                             pools = re.findall(r"^pool\s+(\S+)", line)
-                            servers = re.findall(r"^server\s+(\S+)", line)
+                            servers_found = re.findall(r"^server\s+(\S+)", line)
                             if pools:
                                 server_list.extend(pools)
-                            if servers:
-                                server_list.extend(servers)
-            
-            # 3) Check for systemd-timesyncd (Ubuntu 24.04 default)
-            if not server_list:
-                timesyncd_conf = "/etc/systemd/timesyncd.conf"
-                if os.path.exists(timesyncd_conf):
-                    ntp_conf = timesyncd_conf
-                    ntp_type = "systemd-timesyncd"
-                    service_name = "systemd-timesyncd"
-                    with open(timesyncd_conf, 'r') as f:
-                        lines = f.readlines()
-                        for line in lines:
-                            line_stripped = line.strip()
-                            # Skip commented lines and empty lines
-                            if line_stripped.startswith('#') or not line_stripped:
-                                continue
-                            # Match NTP= line
-                            ntp_match = re.match(r"^NTP=(.+)", line)
-                            if ntp_match:
-                                ntp_servers = ntp_match.group(1).strip().split()
-                                server_list.extend(ntp_servers)
-                            # Also check FallbackNTP=
-                            fallback_match = re.match(r"^FallbackNTP=(.+)", line)
-                            if fallback_match:
-                                fallback_servers = fallback_match.group(1).strip().split()
-                                server_list.extend(fallback_servers)
-                    
-                    # If no servers in config, check runtime status for actual servers
-                    if not server_list:
-                        try:
-                            # Get actual NTP server from timedatectl
-                            out = subprocess.check_output(["timedatectl", "timesync-status"], 
-                                                         stderr=subprocess.PIPE, timeout=5).decode("utf-8")
-                            # Extract NTP server from output
-                            for line in out.split('\n'):
-                                if 'Server:' in line or 'NTP server:' in line:
-                                    # Extract server name/IP
-                                    server_match = re.search(r'(?:Server|NTP server):\s*(\S+)', line)
-                                    if server_match:
-                                        server_list.append(server_match.group(1))
-                        except Exception:
-                            pass
-                    
-                    # If still no servers, show default Ubuntu NTP pools
-                    if not server_list:
-                        server_list.append("(using Ubuntu default NTP pools)")
-            
-            # 4) Fallback to /etc/ntp.conf (legacy)
-            if not server_list:
-                legacy_ntp_conf = "/etc/ntp.conf"
-                if os.path.exists(legacy_ntp_conf):
-                    ntp_conf = legacy_ntp_conf
-                    ntp_type = "ntp"
-                    service_name = "ntp"
-                    with open(legacy_ntp_conf, 'r') as f:
-                        lines = f.readlines()
-                        for line in lines:
-                            line_stripped = line.strip()
-                            if line_stripped.startswith('#'):
-                                continue
-                            pools = re.findall(r"^pool\s+(\S+)", line)
-                            servers = re.findall(r"^server\s+(\S+)", line)
-                            if pools:
-                                server_list.extend(pools)
-                            if servers:
-                                server_list.extend(servers)
+                            if servers_found:
+                                server_list.extend(servers_found)
+                except Exception:
+                    pass
 
-            # Format output
-            output = "\n"
-            if ntp_conf:
-                output += "[config] {} ({})\n".format(ntp_conf, ntp_type if ntp_type else "unknown")
-            else:
-                output += "[config] (no NTP config file found)\n"
-            
+            output = "\n[config] {} ({})\n".format(ntp_conf if ntp_conf else "(no NTP config file)", ntp_type if ntp_type else "unknown")
             if server_list:
                 output += "\n".join(server_list) + "\n"
             else:
                 output += "(no NTP servers configured)\n"
 
-            # 2) runtime status
             output += "\n[service]\n"
             service_status = "unknown"
-            active_service = None
-            
-            # Check which service is actually running
-            services_to_check = ["ntpsec", "chronyd", "systemd-timesyncd", "ntp"]
-            for svc in services_to_check:
+            if service_name:
                 try:
-                    out = subprocess.check_output(["systemctl", "is-active", svc], stderr=subprocess.PIPE).decode("utf-8").strip()
-                    if out == "active":
-                        active_service = svc
-                        service_status = out
-                        break
+                    service_status = subprocess.check_output(
+                        ["systemctl", "is-active", service_name],
+                        stderr=subprocess.PIPE
+                    ).decode("utf-8").strip()
                 except Exception:
-                    continue
-            
-            if active_service:
-                output += "{}: {}\n".format(active_service, service_status)
-            elif service_name:
-                # Check the detected service
-                try:
-                    out = subprocess.check_output(["systemctl", "is-active", service_name], stderr=subprocess.PIPE).decode("utf-8").strip()
-                    output += "{}: {}\n".format(service_name, out)
-                except Exception:
-                    output += "{}: unknown\n".format(service_name)
+                    service_status = "unknown"
+                output += "{}: {}\n".format(service_name, service_status)
             else:
                 output += "NTP service: unknown\n"
 
-            # 3) ntpq, chrony sources, or timedatectl status
-            if ntp_type == "systemd-timesyncd":
-                output += "\n[timedatectl timesync-status]\n"
-                try:
-                    out = subprocess.check_output(["timedatectl", "timesync-status"], 
-                                                 stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
-                    if not out:
-                        out = "(no status available)"
-                    output += out + "\n"
-                except subprocess.TimeoutExpired:
-                    output += "(timeout)\n"
-                except Exception:
-                    output += "(failed - timedatectl not available)\n"
-            elif ntp_type == "chrony":
+            if ntp_type == "chrony":
                 output += "\n[chrony sources]\n"
                 try:
                     out = subprocess.check_output(["chronyc", "sources"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
-                    if not out:
-                        out = "(no sources)"
-                    output += out + "\n"
-                except subprocess.TimeoutExpired:
-                    output += "(timeout)\n"
+                    output += out + "\n" if out else "(no sources)\n"
                 except Exception:
                     output += "(failed - chronyc not available)\n"
             else:
                 output += "\n[ntpq -p]\n"
                 try:
                     out = subprocess.check_output(["ntpq", "-p"], stderr=subprocess.PIPE, timeout=5).decode("utf-8").strip()
-                    if not out:
-                        out = "(no peers)"
-                    output += out + "\n"
-                except subprocess.TimeoutExpired:
-                    output += "(timeout)\n"
+                    output += out + "\n" if out else "(no peers)\n"
                 except Exception:
                     output += "(failed - ntpq not available)\n"
 
@@ -1652,12 +1627,77 @@ class AellaCli(cmd.Cmd, object):
                         shell=True)
 
     def set_tz_callback(self, key, param):
-        if len(param) == 0 or param[0] not in ALL_TIMEZONES:
-            print("Unknown timezone. e.g.: 'America/Los_Angeles'")
+        timezones = self._list_timezones()
+        if not timezones:
+            print("Failed to list timezones")
             return
-        else:
-            cmd = "sudo timedatectl set-timezone '{}'".format(param[0])
-            self.shell_cmd_exec(cmd)
+
+        if len(param) == 0:
+            regions = sorted({tz.split("/", 1)[0] if "/" in tz else tz for tz in timezones})
+            print("\nAvailable regions:\n")
+            for region in regions:
+                print(region)
+            print("\nExamples:")
+            print("  set timezone Asia")
+            print("  set timezone Asia/Seoul")
+            print("  set timezone \"America/Los_Angeles\"\n")
+            return
+
+        tz_raw = " ".join(param).strip()
+        tz = tz_raw
+        if len(tz) >= 2 and tz[0] == tz[-1] and tz[0] in ("'", '"'):
+            tz = tz[1:-1].strip()
+
+        regions = {tz_item.split("/", 1)[0] if "/" in tz_item else tz_item for tz_item in timezones}
+
+        if tz in timezones:
+            proc = subprocess.run(
+                ["sudo", "timedatectl", "set-timezone", tz],
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                err = proc.stderr.strip() if proc.stderr else "Unknown error"
+                print("Failed to set timezone: {}".format(err))
+            return
+
+        if tz in regions and "/" not in tz:
+            candidates = [t for t in timezones if t.startswith(tz + "/")]
+            priority_terms = ["Seoul", "Tokyo", "New_York", "Los_Angeles"]
+
+            def _tz_sort_key(value: str) -> tuple[int, str]:
+                for term in priority_terms:
+                    if term in value:
+                        return (0, value)
+                return (1, value)
+
+            candidates = sorted(candidates, key=_tz_sort_key)
+            limit = 50
+            print("\nAvailable timezones for {}:\n".format(tz))
+            for item in candidates[:limit]:
+                print(item)
+            remaining = len(candidates) - limit
+            if remaining > 0:
+                print("... ({} more)".format(remaining))
+            print("\nPick one: set timezone <Region/City>\n")
+            return
+
+        print("Unknown timezone: {}".format(tz))
+        print("Unknown timezone. e.g.: 'America/Los_Angeles'")
+        print("Try: set timezone <Region>  (to list options)")
+        suggestions = []
+        for item in timezones:
+            if item.startswith(tz):
+                suggestions.append(item)
+        for item in timezones:
+            if tz in item and item not in suggestions:
+                suggestions.append(item)
+        if suggestions:
+            print("Suggestions:")
+            for item in suggestions[:5]:
+                print("  {}".format(item))
+        return
 
     def set_time_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 2:
@@ -1720,160 +1760,84 @@ class AellaCli(cmd.Cmd, object):
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
             return
 
-        # Detect NTP type
-        ntp_type, ntp_conf, service_name = self._detect_ntp_type()
-        
-        if not ntp_conf or not os.path.exists(ntp_conf):
-            print("NTP config file not found. Please ensure NTP service is installed.\n")
-            return
-
         try:
-            # Handle systemd-timesyncd
-            if ntp_type == "systemd-timesyncd":
-                # Read current config
-                with open(ntp_conf, 'r') as f:
-                    lines = f.readlines()
-                
-                # Check if server already exists
-                p = re.escape(param[0])
-                server_exists = False
-                for line in lines:
-                    if re.match(r"^NTP=.*{0}".format(p), line) and not line.strip().startswith('#'):
-                        server_exists = True
-                        break
-                
-                if server_exists:
-                    print("NTP server {} already configured\n".format(param[0]))
+            ntp_type, ntp_conf, service_name = self._detect_ntp_type()
+
+            if ntp_type == "ntpsec" or ntp_type == "chrony" or ntp_type == "ntp":
+                if not ntp_conf or not os.path.exists(ntp_conf):
+                    print("NTP config file not found. Please ensure NTP service is installed.\n")
                     return
-                
-                # Find [Time] section or create it
-                new_lines = []
-                in_time_section = False
-                ntp_line_found = False
-                
-                for line in lines:
-                    if line.strip() == "[Time]":
-                        in_time_section = True
-                        new_lines.append(line)
-                    elif line.strip().startswith('[') and line.strip() != "[Time]":
-                        if in_time_section and not ntp_line_found:
-                            # Add NTP= line before next section
-                            new_lines.append("NTP={}\n".format(param[0]))
-                            ntp_line_found = True
-                        in_time_section = False
-                        new_lines.append(line)
-                    elif in_time_section:
-                        if line.strip().startswith("NTP="):
-                            # Append to existing NTP line
-                            existing_ntp = line.strip().split("=", 1)[1].strip()
-                            if existing_ntp:
-                                new_lines.append("NTP={} {}\n".format(existing_ntp, param[0]))
-                            else:
-                                new_lines.append("NTP={}\n".format(param[0]))
-                            ntp_line_found = True
-                        else:
-                            new_lines.append(line)
-                    else:
-                        new_lines.append(line)
-                
-                # If [Time] section doesn't exist, add it
-                if not in_time_section and not ntp_line_found:
-                    new_lines.append("\n[Time]\n")
-                    new_lines.append("NTP={}\n".format(param[0]))
-                
-                # Write back to file
-                with open(ntp_conf, 'w') as f:
-                    f.writelines(new_lines)
-                
-                # Restart systemd-timesyncd
-                subprocess.call(["sudo", "systemctl", "restart", "systemd-timesyncd"], stderr=subprocess.PIPE)
-                print("Successfully set ntp {}\n".format(param[0]))
-                return
-            
-            # Handle chrony
-            elif ntp_type == "chrony":
+
                 with open(ntp_conf, 'r') as f:
                     lines = f.readlines()
-                
-                # Check if server already exists
+
                 p = re.escape(param[0])
                 server_exists = False
                 for line in lines:
                     if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
                         server_exists = True
                         break
-                
+
                 if server_exists:
                     print("NTP server {} already configured\n".format(param[0]))
                     return
-                
-                # Add server line at end
-                lines.append("server {}\n".format(param[0]))
-                
-                with open(ntp_conf, 'w') as f:
-                    f.writelines(lines)
-                
-                subprocess.call(["sudo", "systemctl", "restart", "chronyd"], stderr=subprocess.PIPE)
-                print("Successfully set ntp {}\n".format(param[0]))
-                return
-            
-            # Handle ntpsec/ntp (existing logic)
-            else:
-                with open(ntp_conf, 'r') as f:
-                    lines = f.readlines()
-                
-                # Check if server already exists
-                p = re.escape(param[0])
-                server_exists = False
-                for line in lines:
-                    if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
-                        server_exists = True
-                        break
-                
-                if server_exists:
-                    print("NTP server {} already configured\n".format(param[0]))
-                    return
-                
-                # Find XDR_NTPSEC_CONFIG block (for ntpsec)
-                tag_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
-                tag_end = "# XDR_NTPSEC_CONFIG_END"
-                xdr_block_start = -1
-                xdr_block_end = -1
-                
-                for i, line in enumerate(lines):
-                    if tag_begin in line:
-                        xdr_block_start = i
-                    if tag_end in line:
-                        xdr_block_end = i
-                        break
-                
-                # Add server to XDR block if it exists, otherwise create new block
-                if xdr_block_start >= 0 and xdr_block_end >= 0:
-                    # Insert server line before tag_end
-                    server_line = "server {}\n".format(param[0])
-                    lines.insert(xdr_block_end, server_line)
+
+                if ntp_type == "chrony":
+                    lines.append("server {}\n".format(param[0]))
                 else:
-                    # Create new XDR block at end of file (for ntpsec) or just add server line (for ntp)
-                    if ntp_type == "ntpsec":
-                        xdr_block = "\n{}\n# Alternative NTP servers\nserver {}\n{}\n".format(
-                            tag_begin, param[0], tag_end)
-                        lines.append(xdr_block)
+                    tag_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
+                    tag_end = "# XDR_NTPSEC_CONFIG_END"
+                    xdr_block_start = -1
+                    xdr_block_end = -1
+
+                    for i, line in enumerate(lines):
+                        if tag_begin in line:
+                            xdr_block_start = i
+                        if tag_end in line:
+                            xdr_block_end = i
+                            break
+
+                    if xdr_block_start >= 0 and xdr_block_end >= 0:
+                        server_line = "server {}\n".format(param[0])
+                        lines.insert(xdr_block_end, server_line)
                     else:
-                        lines.append("server {}\n".format(param[0]))
-                
-                # Write back to file
+                        if ntp_type == "ntpsec":
+                            xdr_block = "\n{}\n# Alternative NTP servers\nserver {}\n{}\n".format(
+                                tag_begin, param[0], tag_end)
+                            lines.append(xdr_block)
+                        else:
+                            lines.append("server {}\n".format(param[0]))
+
                 with open(ntp_conf, 'w') as f:
                     f.writelines(lines)
-                
-                # Restart service
+
                 try:
                     subprocess.call(["sudo", "systemctl", "restart", service_name], stderr=subprocess.PIPE)
                 except Exception:
                     pass
-                
+
                 print("Successfully set ntp {}\n".format(param[0]))
                 return "Successfully set ntp {}\n".format(param[0])
-            
+
+            timesyncd_conf = "/etc/systemd/timesyncd.conf"
+            server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
+            if param[0] not in server_list:
+                server_list.append(param[0])
+
+            self._write_timesyncd_conf(timesyncd_conf, server_list)
+
+            try:
+                subprocess.check_call(
+                    ["systemctl", "restart", "systemd-timesyncd"],
+                    stderr=subprocess.PIPE
+                )
+            except subprocess.CalledProcessError as e:
+                print("Failed to restart systemd-timesyncd: {}\n".format(e))
+                return "Failed to set ntp {}\n".format(param[0])
+
+            print("Successfully set ntp {}\n".format(param[0]))
+            return "Successfully set ntp {}\n".format(param[0])
+
         except Exception as e:
             print("Failed to set ntp {}: {}\n".format(param[0], e))
             return "Failed to set ntp {}\n".format(param[0])
@@ -2212,69 +2176,60 @@ class AellaCli(cmd.Cmd, object):
 
         # Detect NTP type
         ntp_type, ntp_conf, service_name = self._detect_ntp_type()
-        
-        if not ntp_conf or not os.path.exists(ntp_conf):
-            print("NTP config file not found. Please ensure NTP service is installed.\n")
-            return 1
 
         try:
-            # Read current config
+            if ntp_type == "systemd-timesyncd" or not ntp_type:
+                timesyncd_conf = "/etc/systemd/timesyncd.conf"
+                server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
+                if param[0] not in server_list:
+                    print("NTP server {} not found in configuration\n".format(param[0]))
+                    return 1
+
+                server_list = [s for s in server_list if s != param[0]]
+                self._write_timesyncd_conf(timesyncd_conf, server_list)
+
+                try:
+                    subprocess.check_call(
+                        ["systemctl", "restart", "systemd-timesyncd"],
+                        stderr=subprocess.PIPE
+                    )
+                except subprocess.CalledProcessError as e:
+                    print("Failed to restart systemd-timesyncd: {}\n".format(e))
+                    return 1
+
+                print("Successfully unset ntp {}\n".format(param[0]))
+                return 0
+
+            if not ntp_conf or not os.path.exists(ntp_conf):
+                print("NTP config file not found. Please ensure NTP service is installed.\n")
+                return 1
+
             with open(ntp_conf, 'r') as f:
                 lines = f.readlines()
-            
+
             p = re.escape(param[0])
             server_found = False
             new_lines = []
-            
-            # Handle systemd-timesyncd
-            if ntp_type == "systemd-timesyncd":
-                in_time_section = False
-                for line in lines:
-                    if line.strip() == "[Time]":
-                        in_time_section = True
-                        new_lines.append(line)
-                    elif line.strip().startswith('[') and line.strip() != "[Time]":
-                        in_time_section = False
-                        new_lines.append(line)
-                    elif in_time_section and line.strip().startswith("NTP="):
-                        # Remove server from NTP= line
-                        ntp_servers = line.strip().split("=", 1)[1].strip().split()
-                        if param[0] in ntp_servers:
-                            server_found = True
-                            ntp_servers.remove(param[0])
-                            if ntp_servers:
-                                new_lines.append("NTP={}\n".format(" ".join(ntp_servers)))
-                            else:
-                                # If no servers left, comment out or remove the line
-                                new_lines.append("#NTP=\n")
-                        else:
-                            new_lines.append(line)
-                    else:
-                        new_lines.append(line)
-            
+
             # Handle chrony and ntpsec/ntp
-            else:
-                # Remove server lines matching the pattern (not commented)
-                for line in lines:
-                    if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
-                        server_found = True
-                        continue  # Skip this line
-                    new_lines.append(line)
-            
+            for line in lines:
+                if re.match(r"^(pool|server)\s+{0}(\s|$)".format(p), line) and not line.strip().startswith('#'):
+                    server_found = True
+                    continue
+                new_lines.append(line)
+
             if not server_found:
                 print("NTP server {} not found in configuration\n".format(param[0]))
                 return 1
-            
-            # Write back to file
+
             with open(ntp_conf, 'w') as f:
                 f.writelines(new_lines)
-            
-            # Restart service
+
             try:
                 subprocess.call(["sudo", "systemctl", "restart", service_name], stderr=subprocess.PIPE)
             except Exception:
                 pass
-            
+
             print("Successfully unset ntp {}\n".format(param[0]))
             return 0
             
