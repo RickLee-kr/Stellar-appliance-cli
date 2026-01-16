@@ -820,8 +820,118 @@ class AellaCli(cmd.Cmd, object):
                 continue
             match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
             if match:
-                entries.append(match.group(2))
+                entries.append("{} {}".format(match.group(1), match.group(2)))
         return entries
+
+    def _read_ntpsec_conf_entries(self, ntpsec_conf):
+        entries = []
+        if not os.path.exists(ntpsec_conf):
+            return entries
+        try:
+            with open(ntpsec_conf, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            return entries
+
+        seen = set()
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                continue
+            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
+            if match:
+                entry = "{} {}".format(match.group(1), match.group(2))
+                if entry not in seen:
+                    seen.add(entry)
+                    entries.append(entry)
+        return entries
+
+    def _normalize_ntp_target(self, target_raw):
+        target = target_raw.strip()
+        match = re.match(r"^(server|pool)\s+(.+)$", target, re.IGNORECASE)
+        if match:
+            target = match.group(2).strip()
+        return target
+
+    def _remove_ntpsec_block_target(self, ntpsec_conf, target):
+        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
+        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
+        if not os.path.exists(ntpsec_conf):
+            return False
+        try:
+            with open(ntpsec_conf, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            return False
+
+        start_idx = None
+        end_idx = None
+        for idx, line in enumerate(lines):
+            if line.strip() == begin_tag:
+                start_idx = idx
+                continue
+            if line.strip() == end_tag:
+                end_idx = idx
+                break
+
+        if start_idx is None or end_idx is None or end_idx <= start_idx:
+            return False
+
+        removed = False
+        new_block_lines = []
+        for line in lines[start_idx + 1:end_idx]:
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                new_block_lines.append(line)
+                continue
+            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
+            if match and match.group(2) == target:
+                removed = True
+                continue
+            new_block_lines.append(line)
+
+        if not removed:
+            return False
+
+        new_lines = lines[:start_idx + 1] + new_block_lines + lines[end_idx:]
+        with open(ntpsec_conf, 'w') as f:
+            f.writelines(new_lines)
+        return True
+
+    def _remove_ntpsec_conf_target(self, ntpsec_conf, target):
+        if not os.path.exists(ntpsec_conf):
+            return False
+        try:
+            with open(ntpsec_conf, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            return False
+
+        removed = False
+        new_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                new_lines.append(line)
+                continue
+            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
+            if match and match.group(2) == target:
+                removed = True
+                continue
+            new_lines.append(line)
+
+        if not removed:
+            return False
+
+        with open(ntpsec_conf, 'w') as f:
+            f.writelines(new_lines)
+        return True
+
+    def _extract_ntp_entry_target(self, entry):
+        parts = entry.split(None, 1)
+        if len(parts) == 2:
+            return parts[1]
+        return entry
 
     def _write_ntpsec_block(self, ntpsec_conf, servers):
         begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
@@ -921,13 +1031,21 @@ class AellaCli(cmd.Cmd, object):
             output_lines = ["\n[backend]", ntp_backend, ""]
 
             if ntp_backend == "ntpsec":
-                servers = self._read_ntpsec_block_entries(ntp_conf)
-                output_lines.append("[configured NTP servers]")
-                if servers:
-                    for server in servers:
-                        output_lines.append("- {}".format(server))
+                cli_entries = self._read_ntpsec_block_entries(ntp_conf)
+                output_lines.append("[configured NTP servers - CLI managed]")
+                if cli_entries:
+                    for entry in cli_entries:
+                        output_lines.append("- {}".format(entry))
                 else:
-                    output_lines.append("(no NTP servers configured by CLI)")
+                    output_lines.append("(none)")
+
+                conf_entries = self._read_ntpsec_conf_entries(ntp_conf)
+                output_lines.append("\n[configured NTP servers - from ntp.conf]")
+                if conf_entries:
+                    for entry in conf_entries:
+                        output_lines.append("- {}".format(entry))
+                else:
+                    output_lines.append("(none)")
 
                 output_lines.append("\n[service]")
                 service_status = "unknown"
@@ -2382,13 +2500,42 @@ class AellaCli(cmd.Cmd, object):
                     print("NTP config file not found. Please ensure NTP service is installed.\n")
                     return 1
 
-                current_servers, _, _, _ = self._read_ntpsec_block(ntp_conf)
-                if param[0] not in current_servers:
-                    print("NTP server {} not found in configuration\n".format(param[0]))
+                force = False
+                target_tokens = param
+                if param[0] == "--force":
+                    force = True
+                    target_tokens = param[1:]
+
+                if not target_tokens:
+                    print('\n<NTP server> \t Specify NTP server name or IP address\n')
                     return 1
 
-                new_servers = [s for s in current_servers if s != param[0]]
-                self._write_ntpsec_block(ntp_conf, new_servers)
+                target_raw = " ".join(target_tokens).strip()
+                target = self._normalize_ntp_target(target_raw)
+
+                block_entries = self._read_ntpsec_block_entries(ntp_conf)
+                block_targets = [self._normalize_ntp_target(self._extract_ntp_entry_target(entry)) for entry in block_entries]
+                conf_entries = self._read_ntpsec_conf_entries(ntp_conf)
+                conf_targets = [self._normalize_ntp_target(self._extract_ntp_entry_target(entry)) for entry in conf_entries]
+
+                removed = False
+                if target in block_targets:
+                    removed = self._remove_ntpsec_block_target(ntp_conf, target)
+                    if not removed:
+                        print("NTP server {} not found in configuration\n".format(target_raw))
+                        return 1
+                elif target in conf_targets:
+                    if not force:
+                        print("Target exists in ntp.conf but is not CLI-managed. Use: unset ntp --force <target>")
+                        return 1
+                    removed = self._remove_ntpsec_conf_target(ntp_conf, target)
+                    if not removed:
+                        print("NTP server {} not found in configuration\n".format(target_raw))
+                        return 1
+                else:
+                    print("NTP server {} not found in configuration\n".format(target_raw))
+                    return 1
+
                 if not self._restart_ntp_service(service_name):
                     return 1
 
@@ -2409,7 +2556,7 @@ class AellaCli(cmd.Cmd, object):
                     warnings.append("NTP configured but peers not reachable yet")
                     warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
 
-                print("Successfully unset ntp {}\n".format(param[0]))
+                print("Successfully unset ntp {}\n".format(target_raw))
                 for line in warnings:
                     print(line)
                 return 0
