@@ -789,6 +789,40 @@ class AellaCli(cmd.Cmd, object):
                 servers.append(match.group(1))
         return servers, start_idx, end_idx, lines
 
+    def _read_ntpsec_block_entries(self, ntpsec_conf):
+        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
+        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
+        entries = []
+        if not os.path.exists(ntpsec_conf):
+            return entries
+        try:
+            with open(ntpsec_conf, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            return entries
+
+        start_idx = None
+        end_idx = None
+        for idx, line in enumerate(lines):
+            if line.strip() == begin_tag:
+                start_idx = idx
+                continue
+            if line.strip() == end_tag:
+                end_idx = idx
+                break
+
+        if start_idx is None or end_idx is None or end_idx <= start_idx:
+            return entries
+
+        for line in lines[start_idx + 1:end_idx]:
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                continue
+            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
+            if match:
+                entries.append(match.group(2))
+        return entries
+
     def _write_ntpsec_block(self, ntpsec_conf, servers):
         begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
         end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
@@ -887,16 +921,17 @@ class AellaCli(cmd.Cmd, object):
             output_lines = ["\n[backend]", ntp_backend, ""]
 
             if ntp_backend == "ntpsec":
-                servers, _, _, _ = self._read_ntpsec_block(ntp_conf)
-                output_lines.append("[config]")
+                servers = self._read_ntpsec_block_entries(ntp_conf)
+                output_lines.append("[configured NTP servers]")
                 if servers:
                     for server in servers:
-                        output_lines.append(server)
+                        output_lines.append("- {}".format(server))
                 else:
-                    output_lines.append("(no NTP servers configured)")
+                    output_lines.append("(no NTP servers configured by CLI)")
 
                 output_lines.append("\n[service]")
                 service_status = "unknown"
+                enabled_status = "unknown"
                 try:
                     service_status = subprocess.check_output(
                         ["systemctl", "is-active", service_name],
@@ -904,9 +939,16 @@ class AellaCli(cmd.Cmd, object):
                     ).decode("utf-8").strip()
                 except Exception:
                     service_status = "unknown"
-                output_lines.append("{}: {}".format(service_name, service_status))
+                try:
+                    enabled_status = subprocess.check_output(
+                        ["systemctl", "is-enabled", service_name],
+                        stderr=subprocess.PIPE
+                    ).decode("utf-8").strip()
+                except Exception:
+                    enabled_status = "unknown"
+                output_lines.append("- {}: {} ({})".format(service_name, service_status, enabled_status))
 
-                output_lines.append("\n[sync status]")
+                output_lines.append("\n[runtime sync status]")
                 ntpq_proc = subprocess.run(
                     ["ntpq", "-pn"],
                     stdout=subprocess.PIPE,
@@ -920,14 +962,29 @@ class AellaCli(cmd.Cmd, object):
                     print(output)
                     return status, output
 
-                peers, _, warnings = self._parse_ntpq_output(ntpq_proc.stdout)
+                output_lines.extend(ntpq_proc.stdout.splitlines())
 
-                if not peers:
-                    output_lines.append("(no peers)")
-                else:
+                peers, _, warnings = self._parse_ntpq_output(ntpq_proc.stdout)
+                if peers:
+                    all_st16_or_dns = True
+                    all_reach_zero = True
                     for peer in peers:
-                        output_lines.append("peer {} st={} reach={}".format(peer[0], peer[2], peer[3]))
-                output_lines.extend(warnings)
+                        st = peer[2]
+                        reach = peer[3]
+                        reach_int = None
+                        if reach.isdigit():
+                            try:
+                                reach_int = int(reach, 8)
+                            except Exception:
+                                reach_int = None
+                        if st != "16":
+                            all_st16_or_dns = False
+                        if reach_int is None or reach_int > 0:
+                            all_reach_zero = False
+                    if all_st16_or_dns or all_reach_zero:
+                        output_lines.append("warning: peers not reachable yet (st=16/.DNS or reach=0)")
+                elif warnings:
+                    output_lines.append("warning: peers not reachable yet (st=16/.DNS or reach=0)")
 
                 output = "\n".join(output_lines) + "\n"
                 print(output)
@@ -935,14 +992,16 @@ class AellaCli(cmd.Cmd, object):
 
             timesyncd_conf = "/etc/systemd/timesyncd.conf"
             server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
-            output_lines.append("[config]")
+            output_lines.append("[configured NTP servers]")
             if server_list:
-                output_lines.append("NTP={}".format(" ".join(server_list)))
+                for server in server_list:
+                    output_lines.append("- {}".format(server))
             else:
-                output_lines.append("(no NTP servers configured)")
+                output_lines.append("(no NTP servers configured by CLI)")
 
             output_lines.append("\n[service]")
             service_status = "unknown"
+            enabled_status = "unknown"
             try:
                 service_status = subprocess.check_output(
                     ["systemctl", "is-active", service_name],
@@ -950,26 +1009,55 @@ class AellaCli(cmd.Cmd, object):
                 ).decode("utf-8").strip()
             except Exception:
                 service_status = "unknown"
-            output_lines.append("{}: {}".format(service_name, service_status))
+            try:
+                enabled_status = subprocess.check_output(
+                    ["systemctl", "is-enabled", service_name],
+                    stderr=subprocess.PIPE
+                ).decode("utf-8").strip()
+            except Exception:
+                enabled_status = "unknown"
+            output_lines.append("- {}: {} ({})".format(service_name, service_status, enabled_status))
 
-            output_lines.append("\n[sync status]")
+            output_lines.append("\n[runtime sync status]")
             warnings = []
-            server, stratum, offset, error = self._get_timesync_status()
-            if error:
-                output_lines.append("Server: (failed)")
-                output_lines.append("Stratum: (failed)")
-                output_lines.append("Offset: (failed)")
+            status_proc = subprocess.run(
+                ["timedatectl", "timesync-status"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if status_proc.returncode != 0:
+                output_lines.append("(failed - timedatectl not available)")
                 output = "\n".join(output_lines) + "\n"
                 print(output)
                 return status, output
 
-            output_lines.append("Server: {}".format(server if server else "(none)"))
-            output_lines.append("Stratum: {}".format(stratum if stratum else "(none)"))
-            output_lines.append("Offset: {}".format(offset if offset else "(none)"))
-            if not server:
-                warnings.append("warning: no server selected yet")
-            elif "ntp.ubuntu.com" in server:
-                warnings.append("warning: server still using ntp.ubuntu.com")
+            fields = {}
+            for line in status_proc.stdout.splitlines():
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                fields[key.strip()] = value.strip()
+
+            server_value = fields.get("Server", "")
+            if not server_value or server_value.lower() in ("n/a", "none"):
+                warnings.append("Not synchronized yet (check DNS/UDP123/connectivity)")
+            else:
+                if "ntp.ubuntu.com" in server_value and server_list:
+                    warnings.append("Configured servers exist but active server is still default; restart or connectivity may be required")
+
+            output_lines.append("Server        : {}".format(server_value if server_value else "(none)"))
+            output_lines.append("Stratum       : {}".format(fields.get("Stratum", "(none)")))
+            output_lines.append("Poll interval : {}".format(fields.get("Poll interval", "(none)")))
+            output_lines.append("Offset        : {}".format(fields.get("Offset", "(none)")))
+            output_lines.append("Delay         : {}".format(fields.get("Delay", "(none)")))
+            output_lines.append("Jitter        : {}".format(fields.get("Jitter", "(none)")))
+            output_lines.append("Packet count  : {}".format(fields.get("Packet count", "(none)")))
+            output_lines.append("Frequency     : {}".format(fields.get("Frequency", "(none)")))
+            last_sync = fields.get("Last sync", "")
+            if last_sync:
+                output_lines.append("Last sync     : {}".format(last_sync))
             output_lines.extend(warnings)
 
             output = "\n".join(output_lines) + "\n"
