@@ -549,7 +549,7 @@ class AellaCli(cmd.Cmd, object):
 
         if not key:
             if self.is_password_valid():
-                subprocess.call("/usr/bin/sudo bash", shell=True)
+                subprocess.call("/usr/bin/sudo bash -lc 'cd /root && exec bash'", shell=True)
         elif key in self.shell_command:
             # Prevent displaying aella_cli content
             if line.find('cli') >= 0:
