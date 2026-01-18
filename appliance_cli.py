@@ -478,8 +478,9 @@ class AellaCli(cmd.Cmd, object):
                 if cmd != 'help':  # Don't show help command in the list
                     print('{0:15} {1}'.format(cmd, self.root_command_help[cmd]))
             print('')
-            print('For more information on a specific command, type: help <command>')
-            print('For nested commands (e.g., show, set), type: <command> help')
+            print('To get help for a specific command: help <command>')
+            print('To get help for nested commands (show, set): <command> help')
+            print('To run system commands directly: !<command> (e.g., !ping)')
             print('')
         else:
             # Show help for specific command
