@@ -48,6 +48,9 @@ except Exception:
 LOG_DIR = "/var/log/aella"
 ACL_STAGING_PATH = "/var/lib/aella/acl_staging.json"
 ACL_COMMENT_PREFIX = "AELLA_ACL "
+ACL_AUTO_COMMENT = "AELLA_ACL_AUTO Current SSH session"
+LOCAL_ALWAYS_ALLOW_COMMENT = "AELLA_LOCAL_ALWAYS_ALLOW"
+ALWAYS_ALLOW_DEST_IPS = ["127.0.0.1", "192.168.0.100"]
 
 
 def get_username():
@@ -2240,22 +2243,46 @@ class AellaCli(cmd.Cmd, object):
 
     def _ensure_local_ip_allow_rules(self):
         """Ensure local interface IPs are always allowed"""
-        local_ips = self._get_local_interface_ips()
-        for local_ip in local_ips:
-            # Check if rule exists for this local IP
-            cmd_check = "sudo iptables -C INPUT -d {} -j ACCEPT".format(local_ip)
+        for dest_ip in ALWAYS_ALLOW_DEST_IPS:
+            cidr = "{}/32".format(dest_ip)
+            cmd_check = (
+                "sudo iptables -C INPUT -d {} -m comment --comment \"{}\" -j ACCEPT"
+            ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
             proc = subprocess.Popen(cmd_check, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             proc.communicate()
-            
+
             if proc.returncode != 0:
-                # Rule doesn't exist, add it at the beginning
-                cmd_add = "sudo iptables -I INPUT 1 -d {} -m comment --comment 'Local interface IP - always allow' -j ACCEPT".format(local_ip)
-                proc_add = subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                proc_add.communicate()
-                # If comment module not available, try without comment
-                if proc_add.returncode != 0:
-                    cmd_add_no_comment = "sudo iptables -I INPUT 1 -d {} -j ACCEPT".format(local_ip)
-                    subprocess.Popen(cmd_add_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+                cmd_add = (
+                    "sudo iptables -I INPUT 1 -d {} -m comment --comment \"{}\" -j ACCEPT"
+                ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
+                subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+    def _get_current_ssh_client_ip(self):
+        """Get current SSH client IPv4 address if available"""
+        for env_key in ("SSH_CLIENT", "SSH_CONNECTION"):
+            env_val = os.environ.get(env_key)
+            if not env_val:
+                continue
+            tokens = env_val.strip().split()
+            candidate = tokens[0] if tokens else None
+            if not candidate:
+                continue
+            if self.valid_ipv4_address(candidate):
+                return candidate
+        return None
+
+    def _iptables_add_auto_ssh(self, ssh_ip):
+        """Add auto-allow rule for current SSH client"""
+        cidr = "{}/32".format(ssh_ip)
+        comment_part = '-m comment --comment "{}"'.format(ACL_AUTO_COMMENT)
+        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport 22 {} -j ACCEPT".format(cidr, comment_part)
+        check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        check_proc.communicate()
+        if check_proc.returncode == 0:
+            return
+
+        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport 22 {} -j ACCEPT".format(cidr, comment_part)
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
     def _ensure_default_accept_policy(self):
         """Ensure default INPUT chain policy is ACCEPT if no user-defined ACL rules exist"""
@@ -2473,13 +2500,17 @@ class AellaCli(cmd.Cmd, object):
                     return
                 reset = True
 
-            self._ensure_local_ip_allow_rules()
             self._ensure_default_accept_policy()
 
             data = self._load_acl_staging()
             rules = data.get("rules", [])
             if reset:
                 self._iptables_delete_user_rules()
+
+            self._ensure_local_ip_allow_rules()
+            ssh_ip = self._get_current_ssh_client_ip()
+            if ssh_ip:
+                self._iptables_add_auto_ssh(ssh_ip)
 
             for rule in rules:
                 action = rule.get("action")
