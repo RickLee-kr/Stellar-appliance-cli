@@ -2408,27 +2408,56 @@ class AellaCli(cmd.Cmd, object):
         comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
         escaped_comment = comment_value.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
         comment_part = '-m comment --comment "{}"'.format(escaped_comment)
+        any_source = source in ("0.0.0.0/0", "0.0.0.0")
 
         for port in ports:
             if port == 'all':
                 if action == 'allow':
-                    cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
-                    check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
+                    if any_source:
+                        cmd = "sudo iptables -I INPUT {} -j ACCEPT".format(comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -j ACCEPT"
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
                 else:
-                    cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
-                    check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
+                    if any_source:
+                        cmd = "sudo iptables -I INPUT {} -j DROP".format(comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -j DROP"
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
             else:
                 if action == 'allow':
-                    cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, comment_part).strip()
-                    check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port)
+                    if any_source:
+                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} -j ACCEPT".format(port, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} -j ACCEPT".format(port)
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port)
                 else:
-                    cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, comment_part).strip()
-                    check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port)
+                    if any_source:
+                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} -j DROP".format(port, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} -j DROP".format(port)
+                    else:
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port)
 
             check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             check_proc.communicate()
             if check_proc.returncode == 0:
                 continue
+
+            if any_source:
+                if port == 'all':
+                    alt_check_cmd = "sudo iptables -C INPUT -j {}".format("ACCEPT" if action == "allow" else "DROP")
+                else:
+                    alt_check_cmd = "sudo iptables -C INPUT -p tcp --dport {} -j {}".format(
+                        port, "ACCEPT" if action == "allow" else "DROP"
+                    )
+                alt_proc = subprocess.Popen(alt_check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                alt_proc.communicate()
+                if alt_proc.returncode == 0:
+                    continue
 
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
@@ -2797,14 +2826,19 @@ class AellaCli(cmd.Cmd, object):
                 return False
 
             # Build deletion commands from rule specs
+            any_source = source in ("0.0.0.0/0", "0.0.0.0")
             delete_cmds = []
             for port in ports:
                 if port == 'all':
                     for line in rule_lines:
                         if not line.startswith("-A INPUT"):
                             continue
-                        if "-s {}".format(source) not in line:
-                            continue
+                        if any_source:
+                            if "-s 0.0.0.0/0" not in line and " -s " in line:
+                                continue
+                        else:
+                            if "-s {}".format(source) not in line:
+                                continue
                         if _is_excluded_rule(line):
                             continue
                         delete_cmds.append(line.replace("-A INPUT", "sudo iptables -D INPUT", 1))
@@ -2821,8 +2855,12 @@ class AellaCli(cmd.Cmd, object):
                     for line in rule_lines:
                         if not line.startswith("-A INPUT"):
                             continue
-                        if "-s {}".format(source) not in line:
-                            continue
+                        if any_source:
+                            if "-s 0.0.0.0/0" not in line and " -s " in line:
+                                continue
+                        else:
+                            if "-s {}".format(source) not in line:
+                                continue
                         if "--dport {}".format(port_num) not in line:
                             continue
                         if _is_excluded_rule(line):
