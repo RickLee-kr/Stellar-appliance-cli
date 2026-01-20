@@ -1442,6 +1442,8 @@ class AellaCli(cmd.Cmd, object):
 
     def set_interface_sensor(self, param):
         """Configure host interface for Sensor host (uses /etc/network/interfaces)."""
+        print("DEBUG set interface param={}".format(param))
+        param = [p for p in param if p != '']
         if not param or len(param) < 1:
             print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
             return
@@ -1452,6 +1454,11 @@ class AellaCli(cmd.Cmd, object):
             return
 
         if not self.is_device_exist(interface):
+            return
+
+        if len(param) >= 2 and param[1] == 'restart':
+            print('Restarting network interface. You need to use new IP address to reconnect...\n')
+            self._restart_interface_with_verification(interface)
             return
 
         if len(param) == 1 or (len(param) == 2 and param[1] == '?') or (len(param) == 2 and param[1].endswith('?')):
@@ -4309,6 +4316,50 @@ class AellaCli(cmd.Cmd, object):
             print("Failed to restart networking! {}".format(e))
             return False
 
+        addr_out = subprocess.run(
+            "ip -4 addr show dev {}".format(interface),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        inet_lines = []
+        if addr_out.returncode == 0 and addr_out.stdout:
+            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout)
+        if len(inet_lines) > 1:
+            if not expected_ip:
+                print("Multiple IPv4 addresses detected on {} after restart".format(interface))
+                return False
+            subprocess.run(
+                "ip -4 addr flush dev {}".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            add_proc = subprocess.run(
+                "ip -4 addr add {} dev {}".format(expected_ip, interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if add_proc.returncode != 0:
+                err_msg = add_proc.stderr.strip() if add_proc.stderr else "Unknown error"
+                print("Failed to recover IP address on {}: {}".format(interface, err_msg))
+                return False
+            addr_out = subprocess.run(
+                "ip -4 addr show dev {}".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout or "")
+            if len(inet_lines) != 1 or expected_ip not in inet_lines:
+                print("Failed to verify IPv4 address count on {} after recovery".format(interface))
+                return False
+
         if expected_ip:
             check_proc = subprocess.run(
                 "ip -4 addr show dev {}".format(interface),
@@ -4367,6 +4418,9 @@ class AellaCli(cmd.Cmd, object):
         if self.is_sensor_host_mode():
             self.set_interface_sensor(param)
             return
+
+        print("DEBUG set interface param={}".format(param))
+        param = [p for p in param if p != '']
 
         if not param or param[0].endswith('?') or len(param) <= 4:
             if (len(param) < 1 or (len(param) == 1 and param[0] == '?')) or \
@@ -4445,6 +4499,11 @@ class AellaCli(cmd.Cmd, object):
 
         if not self.is_device_exist(interface):
            return
+
+        if len(param) >= 2 and param[1] == 'restart':
+            print('Restarting network interface. You need to use new IP address to reconnect...\n')
+            self._restart_interface_with_verification(interface)
+            return
 
         tokens = [t for t in param[1:]]
         keywords = [t.lower() for t in tokens if t.lower() in {"ip", "gateway", "dns", "restart"}]
