@@ -46,6 +46,8 @@ except Exception:
 
 # Logging utilities
 LOG_DIR = "/var/log/aella"
+ACL_STAGING_PATH = "/var/lib/aella/acl_staging.json"
+ACL_COMMENT_PREFIX = "AELLA_ACL "
 
 
 def get_username():
@@ -2298,12 +2300,202 @@ class AellaCli(cmd.Cmd, object):
         except Exception:
             pass
 
+    def _load_acl_staging(self):
+        """Load staged ACL rules from file"""
+        default_data = {"rules": []}
+        try:
+            with open(ACL_STAGING_PATH, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return default_data
+        except PermissionError:
+            proc = subprocess.run(
+                ["sudo", "cat", ACL_STAGING_PATH],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                return default_data
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return default_data
+        except json.JSONDecodeError:
+            return default_data
+        except Exception:
+            return default_data
+
+        if not isinstance(data, dict) or "rules" not in data or not isinstance(data["rules"], list):
+            return default_data
+        return data
+
+    def _save_acl_staging(self, data):
+        """Save staged ACL rules to file"""
+        target_dir = os.path.dirname(ACL_STAGING_PATH)
+        make_dir(target_dir, root=True)
+        payload = json.dumps(data, indent=2, sort_keys=False)
+        tmp_path = "/tmp/acl_staging.json"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(payload)
+            subprocess.run(
+                ["sudo", "mv", tmp_path, ACL_STAGING_PATH],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            try:
+                subprocess.run(
+                    ["sudo", "tee", ACL_STAGING_PATH],
+                    input=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+    def _stage_rule(self, action, source, ports, desc):
+        """Stage a rule in ACL staging file, avoid duplicates"""
+        data = self._load_acl_staging()
+        rules = data.get("rules", [])
+        staged_rule = {
+            "action": action,
+            "source": source,
+            "ports": ports,
+            "desc": desc or "",
+        }
+        for rule in rules:
+            if (
+                rule.get("action") == staged_rule["action"]
+                and rule.get("source") == staged_rule["source"]
+                and rule.get("ports") == staged_rule["ports"]
+                and rule.get("desc") == staged_rule["desc"]
+            ):
+                return False
+        rules.append(staged_rule)
+        data["rules"] = rules
+        self._save_acl_staging(data)
+        return True
+
+    def _iptables_add(self, action, source, ports, desc):
+        """Add ACL rules to iptables with comment prefix"""
+        comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
+        escaped_comment = comment_value.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+        comment_part = '-m comment --comment "{}"'.format(escaped_comment)
+
+        for port in ports:
+            if port == 'all':
+                if action == 'allow':
+                    cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
+                    check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
+                else:
+                    cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
+                    check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
+            else:
+                if action == 'allow':
+                    cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, comment_part).strip()
+                    check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port)
+                else:
+                    cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, comment_part).strip()
+                    check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port)
+
+            check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            check_proc.communicate()
+            if check_proc.returncode == 0:
+                continue
+
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                error_msg = err.decode('utf-8', errors='ignore') if err else 'Unknown error'
+                if 'comment' in error_msg.lower() or 'match' in error_msg.lower():
+                    cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
+                    subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+    def _iptables_delete_user_rules(self):
+        """Delete user ACL rules with AELLA_ACL prefix from INPUT chain"""
+        cmd = "sudo iptables -L INPUT -n --line-numbers"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate()
+        if proc.returncode != 0 or not out:
+            return
+
+        lines = out.decode('utf-8', errors='ignore').split('\n')
+        line_nums_to_remove = []
+        for line in lines:
+            if ACL_COMMENT_PREFIX.strip() in line:
+                match = re.match(r'^\s*(\d+)\s+', line)
+                if match:
+                    line_nums_to_remove.append(match.group(1))
+
+        for line_num in sorted(line_nums_to_remove, key=int, reverse=True):
+            del_cmd = "sudo iptables -D INPUT {}".format(line_num)
+            subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
     def set_acl_callback(self, key, param):
         """Configure iptables ACL rules
         Usage: set acl allow <IP/network> <port> [port2 ...] | all [description]
                set acl deny <IP/network> <port> [port2 ...] | all [description]
+               set acl apply [--reset]
         """
-        if not param or len(param) < 3:
+        if not param:
+            print('\n<action> <IP/network> <port> [...] | all [description]  Configure ACL rule')
+            print('  action: allow or deny')
+            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
+            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
+            print('  Multiple ports can be specified separated by space')
+            print('  description: Optional description/comment for this rule')
+            print('  apply: Apply staged ACL rules (merge)')
+            print('  apply --reset: Reset user ACL rules and rebuild from staging')
+            print('\nExamples:')
+            print('  set acl allow 192.168.1.100 22 "Admin SSH access"')
+            print('  set acl allow 192.168.1.0/24 80 443 "Web servers"')
+            print('  set acl allow 10.0.0.0/8 all "Internal network"')
+            print('  set acl deny 192.168.1.200 22 "Blocked user"')
+            print('  set acl apply')
+            print('  set acl apply --reset\n')
+            return
+
+        if param[0].lower() == 'apply':
+            reset = False
+            if len(param) > 2:
+                print('Invalid option: use "set acl apply" or "set acl apply --reset"\n')
+                return
+            if len(param) == 2:
+                if param[1] != '--reset':
+                    print('Invalid option: use "set acl apply" or "set acl apply --reset"\n')
+                    return
+                reset = True
+
+            self._ensure_local_ip_allow_rules()
+            self._ensure_default_accept_policy()
+
+            data = self._load_acl_staging()
+            rules = data.get("rules", [])
+            if reset:
+                self._iptables_delete_user_rules()
+
+            for rule in rules:
+                action = rule.get("action")
+                source = rule.get("source")
+                ports = rule.get("ports", [])
+                desc = rule.get("desc", "")
+                if action in ['allow', 'deny'] and source and ports:
+                    self._iptables_add(action, source, ports, desc)
+
+            if reset:
+                print('Applied staged ACL rules with reset (rebuild completed).\n')
+            else:
+                print('Applied staged ACL rules (merge completed).\n')
+            return
+
+        if len(param) < 3:
             print('\n<action> <IP/network> <port> [...] | all [description]  Configure ACL rule')
             print('  action: allow or deny')
             print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
@@ -2375,12 +2567,6 @@ class AellaCli(cmd.Cmd, object):
         # Get local interface IPs
         local_ips = self._get_local_interface_ips()
         
-        # Ensure local interface IPs are always allowed (destination-based rules)
-        self._ensure_local_ip_allow_rules()
-        
-        # Ensure default policy is ACCEPT if no user-defined ACL rules
-        self._ensure_default_accept_policy()
-        
         # For deny rules, check if source IP matches any local interface IP
         # If so, skip adding the deny rule (local IPs should never be blocked)
         if action == 'deny':
@@ -2399,93 +2585,24 @@ class AellaCli(cmd.Cmd, object):
                         print('Warning: Network {} may include local interface IPs. Deny rule may not block local IP traffic.\n'.format(source))
                         break
         
-        try:
-            # Build iptables rules with comment
-            rules_added = []
-            comment_part = ""
-            if description:
-                # Escape quotes and special characters for shell
-                escaped_desc = description.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
-                comment_part = '-m comment --comment "{}"'.format(escaped_desc)
-            
+        # Validate port numbers
+        if ports != ['all']:
             for port in ports:
-                if port == 'all':
-                    # Rule for all ports
-                    if action == 'allow':
-                        cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
-                    else:
-                        # For deny rules: ensure local IP destination traffic is never blocked
-                        # Local IP destination rules are already added by _ensure_local_ip_allow_rules()
-                        # and will match before this deny rule, so local IP traffic is protected
-                        cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
-                else:
-                    # Validate port number
-                    try:
-                        port_num = int(port)
-                        if port_num < 1 or port_num > 65535:
-                            print('Invalid port number: {} (must be 1-65535)\n'.format(port))
-                            return
-                    except ValueError:
-                        print('Invalid port number: {}\n'.format(port))
+                try:
+                    port_num = int(port)
+                    if port_num < 1 or port_num > 65535:
+                        print('Invalid port number: {} (must be 1-65535)\n'.format(port))
                         return
-                    
-                    # Rule for specific port
-                    if action == 'allow':
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port_num, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port_num)
-                    else:
-                        # For deny rules: ensure local IP destination traffic is never blocked
-                        # Local IP destination rules are already added by _ensure_local_ip_allow_rules()
-                        # and will match before this deny rule, so local IP traffic is protected
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port_num, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port_num)
-                
-                # Check if rule already exists (without comment check for simplicity)
-                check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                check_proc.communicate()
-                
-                if check_proc.returncode == 0:
-                    print('ACL rule already exists: {} {} {}\n'.format(action, source, port))
-                    continue
-                
-                # Add rule
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate()
-                
-                if proc.returncode == 0:
-                    rules_added.append((action, source, port, description))
-                else:
-                    error_msg = err.decode('utf-8', errors='ignore') if err else 'Unknown error'
-                    # If comment module not available, try without comment
-                    if 'comment' in error_msg.lower() or 'match' in error_msg.lower():
-                        # Retry without comment
-                        cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
-                        proc2 = subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        proc2.communicate()
-                        if proc2.returncode == 0:
-                            rules_added.append((action, source, port, None))
-                            print('Note: Comment not supported (iptables comment module not available), rule added without description.\n')
-                        else:
-                            print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
-                    else:
-                        print('Failed to add ACL rule for {} {} {}: {}\n'.format(action, source, port, error_msg))
-            
-            if rules_added:
-                print('Successfully added ACL rules:\n')
-                for rule in rules_added:
-                    action, source, port, desc = rule
-                    if desc:
-                        print('  {} {} {} ({})\n'.format(action, source, port, desc))
-                    else:
-                        print('  {} {} {}\n'.format(action, source, port))
-                print('Note: Rules are added to iptables. To make them persistent, save iptables rules.\n')
-            else:
-                print('No new rules were added.\n')
-            
-        except Exception as e:
-            print('Failed to set ACL: {}\n'.format(e))
+                except ValueError:
+                    print('Invalid port number: {}\n'.format(port))
+                    return
+
+        staged = self._stage_rule(action, source, ports, description)
+        if staged:
+            desc_out = description if description else ""
+            print('Staged: {} {} {} ({})\n'.format(action, source, " ".join(ports), desc_out))
+        else:
+            print('ACL rule already staged: {} {} {}\n'.format(action, source, " ".join(ports)))
 
     def unset_ntp_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 1:
