@@ -1442,7 +1442,7 @@ class AellaCli(cmd.Cmd, object):
 
     def set_interface_sensor(self, param):
         """Configure host interface for Sensor host (uses /etc/network/interfaces)."""
-        print("DEBUG set interface param={}".format(param))
+        self._debug_print("DEBUG set interface param={}".format(param))
         param = [p for p in param if p != '']
         if not param or len(param) < 1:
             print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
@@ -3724,12 +3724,53 @@ class AellaCli(cmd.Cmd, object):
         except Exception as e:
             print("Failed to get patch history: {}".format(e))
 
+    @staticmethod
+    def _should_debug():
+        return os.environ.get("AELLA_CLI_DEBUG") == "1"
+
+    def _debug_print(self, msg):
+        if self._should_debug():
+            print(msg)
+
+    def write_full_interfaces_file(self, lines):
+        main_path = "/etc/network/interfaces"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = "{}.bak.{}".format(main_path, timestamp)
+        try:
+            if os.path.exists(main_path):
+                with open(main_path, 'r') as f:
+                    existing = f.read()
+                with open(backup_path, 'w') as f:
+                    f.write(existing)
+            with open(main_path, 'w') as f:
+                f.write("\n".join([line.rstrip("\n") for line in lines]) + "\n")
+            with open(main_path, 'r') as f:
+                final = f.read()
+            if not final.strip():
+                print("Failed to update interface configuration: file is empty")
+                return False
+            if "iface lo inet loopback" not in final and "source /etc/network/interfaces.d/*" not in final:
+                print("Failed to update interface configuration: missing base stanza/source")
+                return False
+            return True
+        except Exception as e:
+            print('Failed to update interface configuration')
+            print(e)
+            return False
+
     def update_interface_file(self, interface, contents):
-        """Update interface configuration file.
+        """Update interface configuration file block only.
         For DP appliances: mgt in /etc/network/interfaces, data1g/data10g in interfaces.d/
         For Sensor/AIO installers: all interfaces in /etc/network/interfaces
         """
         try:
+            for line in contents:
+                if re.match(r'^\s*source\s+/etc/network/interfaces\.d/\*', line):
+                    print("Invalid interface block contents: contains source line")
+                    return False
+                if re.match(r'^\s*iface\s+lo\s+inet\s+loopback', line):
+                    print("Invalid interface block contents: contains loopback stanza")
+                    return False
             # Check if interface is in /etc/network/interfaces (Sensor/AIO installer format)
             interface_in_main = False
             if os.path.exists("/etc/network/interfaces"):
@@ -4383,7 +4424,7 @@ class AellaCli(cmd.Cmd, object):
             conf_f.close()
             # Now the parsing is finished, update interface file
             # DEBUG: print("{0}".format(contents))
-            if not self.update_interface_file(interface, contents):
+            if not self.write_full_interfaces_file(contents):
                 status = 1
                 return
             if field.lower() == "restart":
@@ -4678,7 +4719,7 @@ class AellaCli(cmd.Cmd, object):
             self.set_interface_sensor(param)
             return
 
-        print("DEBUG set interface param={}".format(param))
+        self._debug_print("DEBUG set interface param={}".format(param))
         param = [p for p in param if p != '']
 
         if not param or param[0].endswith('?') or len(param) <= 4:
