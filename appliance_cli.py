@@ -4306,10 +4306,42 @@ class AellaCli(cmd.Cmd, object):
 
     def restart_new_network_manager(self, interface, expected_ip=None, expected_dns=None):
         try:
-            cmd = "rm -f /run/resolvconf/interface/{0}.dhclient && ip address flush dev {0} && ifdown {0} 2> /dev/null && ifup {0} 2>/dev/null".format(interface)
-            proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
-                err_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
+            rm_proc = subprocess.run(
+                "rm -f /run/resolvconf/interface/{0}.dhclient".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            flush_proc = subprocess.run(
+                "ip address flush dev {0}".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if flush_proc.returncode != 0:
+                err_msg = flush_proc.stderr.strip() if flush_proc.stderr else flush_proc.stdout.strip()
+                err_msg = err_msg if err_msg else "Unknown error"
+                print("Failed to restart networking! {}".format(err_msg))
+                return False
+            down_proc = subprocess.run(
+                "ifdown {0} 2>/dev/null".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            up_proc = subprocess.run(
+                "ifup {0} 2>/dev/null".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if up_proc.returncode != 0:
+                err_msg = up_proc.stderr.strip() if up_proc.stderr else up_proc.stdout.strip()
+                err_msg = err_msg if err_msg else "Unknown error"
                 print("Failed to restart networking! {}".format(err_msg))
                 return False
         except Exception as e:
