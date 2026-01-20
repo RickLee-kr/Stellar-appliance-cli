@@ -1199,6 +1199,16 @@ class AellaCli(cmd.Cmd, object):
         output = None
         dns_servers = []
         interfaces_with_dns = {}
+
+        def _dedupe_preserve_order(items):
+            seen = set()
+            result = []
+            for item in items:
+                if item in seen:
+                    continue
+                seen.add(item)
+                result.append(item)
+            return result
         
         try:
             # Read /etc/network/interfaces
@@ -1254,12 +1264,9 @@ class AellaCli(cmd.Cmd, object):
                             continue
             
             # Remove duplicates while preserving order
-            seen = set()
-            unique_dns = []
-            for dns in dns_servers:
-                if dns not in seen:
-                    seen.add(dns)
-                    unique_dns.append(dns)
+            unique_dns = _dedupe_preserve_order(dns_servers)
+            for iface in list(interfaces_with_dns.keys()):
+                interfaces_with_dns[iface] = _dedupe_preserve_order(interfaces_with_dns[iface])
             
             # Format output
             output = "\n"
