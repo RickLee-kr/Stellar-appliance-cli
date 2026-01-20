@@ -1330,8 +1330,8 @@ class AellaCli(cmd.Cmd, object):
                         output += "Note: Default policy is ACCEPT (all traffic allowed when no ACL rules are set)\n"
                     output += "\n"
             
-            # Get local interface IPs
-            local_ips = self._get_local_interface_ips()
+            # Get always-allowed destination IPs
+            local_ips = list(ALWAYS_ALLOW_DEST_IPS)
             if local_ips:
                 output += "Local Interface IPs (destination - always allowed, cannot be blocked): {}\n".format(', '.join(local_ips))
                 output += "Note: Traffic to local interface IPs is always allowed regardless of ACL deny rules\n"
