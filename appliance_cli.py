@@ -4538,24 +4538,7 @@ class AellaCli(cmd.Cmd, object):
             if up_proc.returncode != 0:
                 err_text = "{}\n{}".format(up_proc.stdout or "", up_proc.stderr or "")
                 if expected_ip and "File exists" in err_text:
-                    addr_out = subprocess.run(
-                        "ip -4 addr show dev {}".format(interface),
-                        shell=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                    inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout or "")
-                    if len(inet_lines) == 1 and expected_ip in inet_lines:
-                        print("Warning: ifup returned File exists; interface state appears correct")
-                    else:
-                        print("Failed to restart networking!")
-                        print("returncode: {}".format(up_proc.returncode))
-                        if up_proc.stdout:
-                            print("stdout: {}".format(up_proc.stdout.strip()))
-                        if up_proc.stderr:
-                            print("stderr: {}".format(up_proc.stderr.strip()))
-                        return False
+                    print("Warning: ifup returned File exists; continuing with state verification")
                 else:
                     print("Failed to restart networking!")
                     print("returncode: {}".format(up_proc.returncode))
