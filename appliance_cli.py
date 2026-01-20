@@ -1306,177 +1306,61 @@ class AellaCli(cmd.Cmd, object):
     def show_acl_callback(self, key, param):
         """Show current iptables ACL rules with descriptions"""
         try:
-            # Ensure local interface IPs are always allowed
-            self._ensure_local_ip_allow_rules()
-            
-            # Ensure default policy is ACCEPT if no ACL rules
-            self._ensure_default_accept_policy()
-            
             output = "\n"
-            output += "=" * 95 + "\n"
-            output += "Access Control List (iptables INPUT chain rules)\n"
-            output += "=" * 95 + "\n"
-            
-            # Get default policy
-            cmd_policy = "sudo iptables -L INPUT -n | head -1"
-            proc_policy = subprocess.Popen(cmd_policy, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out_policy, _ = proc_policy.communicate()
-            if out_policy:
-                policy_line = out_policy.decode('utf-8', errors='ignore').strip()
-                if 'policy' in policy_line.lower():
-                    output += "Default Policy: {}\n".format(policy_line)
-                    # If no user-defined rules exist, default policy should be ACCEPT
-                    if 'ACCEPT' in policy_line:
-                        output += "Note: Default policy is ACCEPT (all traffic allowed when no ACL rules are set)\n"
-                    output += "\n"
-            
-            # Get always-allowed destination IPs
-            local_ips = list(ALWAYS_ALLOW_DEST_IPS)
-            if local_ips:
-                output += "Local Interface IPs (destination - always allowed, cannot be blocked): {}\n".format(', '.join(local_ips))
-                output += "Note: Traffic to local interface IPs is always allowed regardless of ACL deny rules\n"
-                output += "Note: Local interface IP rules are hidden from this list and cannot be removed\n"
-                output += "\n"
-            
-            # Get iptables rules for INPUT chain
-            # iptables -L automatically shows comments if comment module is used
-            cmd = "sudo iptables -L INPUT -n -v --line-numbers"
+            output += "=" * 60 + "\n"
+            output += "Access Control List (AELLA_ACL rules)\n"
+            output += "=" * 60 + "\n"
+
+            mgt_ip = self._get_mgt_ipv4()
+            dest_cidr = "{}/32".format(mgt_ip)
+
+            cmd = "sudo iptables -S INPUT"
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
-            
-            if proc.returncode == 0 and out:
-                rules_output = out.decode('utf-8', errors='ignore')
-                
-                # Also get detailed rule info with comments from iptables-save
-                cmd_save = "sudo iptables-save -t filter | grep '^-A INPUT'"
-                proc_save = subprocess.Popen(cmd_save, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out_save, _ = proc_save.communicate()
-                
-                # Parse rules and create comment mapping (excluding local IP rules)
-                rule_comments = {}
-                if out_save:
-                    save_rules = out_save.decode('utf-8', errors='ignore').split('\n')
-                    for line in save_rules:
-                        if '-A INPUT' in line:
-                            # Skip local IP destination rules
-                            is_local_rule = False
-                            for local_ip in local_ips:
-                                if '-d {}'.format(local_ip) in line:
-                                    is_local_rule = True
-                                    break
-                            # Also skip rules with "Local interface IP" comment
-                            if 'Local interface IP' in line or 'always allow' in line.lower():
-                                is_local_rule = True
-                            
-                            if is_local_rule:
-                                continue
-                            
-                            if '--comment' in line:
-                                # Extract comment
-                                comment_match = re.search(r'--comment\s+"([^"]+)"', line)
-                                if comment_match:
-                                    comment = comment_match.group(1)
-                                    # Extract source
-                                    source_match = re.search(r'-s\s+(\S+)', line)
-                                    if source_match:
-                                        source = source_match.group(1)
-                                        # Extract port if exists
-                                        port_match = re.search(r'--dport\s+(\d+)', line)
-                                        port = port_match.group(1) if port_match else 'all'
-                                        # Extract target
-                                        target_match = re.search(r'-j\s+(\S+)', line)
-                                        target = target_match.group(1) if target_match else ''
-                                        
-                                        # Create unique key: source:port:target
-                                        rule_key = "{}:{}:{}".format(source, port, target)
-                                        rule_comments[rule_key] = comment
-                
-                # Parse iptables-save to identify local IP destination rules
-                # We'll use this to filter them out from the display
-                has_local_dest_rules = False
-                if out_save:
-                    save_rules = out_save.decode('utf-8', errors='ignore').split('\n')
-                    for line in save_rules:
-                        if '-A INPUT' in line:
-                            # Check if this is a local IP destination rule
-                            for local_ip in local_ips:
-                                if '-d {}'.format(local_ip) in line:
-                                    has_local_dest_rules = True
-                                    break
-                            # Also check for "Local interface IP" comment
-                            if 'Local interface IP' in line or 'always allow' in line.lower():
-                                has_local_dest_rules = True
-                            if has_local_dest_rules:
-                                break
-                
-                # Format output: add comments to matching rules, but filter out local IP destination rules
-                lines = rules_output.split('\n')
-                formatted_lines = []
-                for i, line in enumerate(lines):
-                    # Keep chain headers
-                    if 'Chain' in line or ('num' in line.lower() and 'target' in line.lower() and 'prot' in line.lower()):
-                        formatted_lines.append(line)
-                        continue
-                    
-                    # Skip empty lines in headers
-                    if not line.strip() and i < 3:
-                        continue
-                    
-                    # Check if this line contains a rule (has ACCEPT or DROP)
-                    if 'ACCEPT' in line or 'DROP' in line or 'REJECT' in line:
-                        # Check if this is a local IP destination rule
-                        is_local_rule = False
-                        
-                        # If we have local destination rules and this line contains a local IP with ACCEPT,
-                        # check if it looks like a destination rule (source is 0.0.0.0/0 or wildcard)
-                        if has_local_dest_rules and 'ACCEPT' in line:
-                            for local_ip in local_ips:
-                                if local_ip in line:
-                                    # Check if source is 0.0.0.0/0 (wildcard = any source to this destination)
-                                    # This is the typical pattern for destination-based rules
-                                    if '0.0.0.0/0' in line or '0.0.0.0' in line:
-                                        # Additional check: make sure it's not a user rule with source 0.0.0.0/0
-                                        # User rules with source 0.0.0.0/0 are rare, but possible
-                                        # For safety, if the line has the local IP and wildcard source, it's likely our destination rule
-                                        is_local_rule = True
-                                        break
-                        
-                        if is_local_rule:
-                            continue  # Skip local IP destination rules
-                        
-                        formatted_lines.append(line)
-                        
-                        # Extract source IP/network for comment matching
-                        source_match = re.search(r'\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+', line)
-                        if source_match:
-                            source = source_match.group(1)
-                            # Skip if this source is a local IP (shouldn't happen for user rules, but double-check)
-                            if source not in local_ips:
-                                # Extract port
-                                port_match = re.search(r'dpt:(\d+)', line)
-                                port = port_match.group(1) if port_match else 'all'
-                                # Extract target
-                                target_match = re.search(r'\s+(ACCEPT|DROP|REJECT)\s*$', line)
-                                target = target_match.group(1) if target_match else ''
-                                
-                                rule_key = "{}:{}:{}".format(source, port, target)
-                                if rule_key in rule_comments:
-                                    formatted_lines.append("    [Description] {}".format(rule_comments[rule_key]))
-                    elif line.strip():
-                        # Other non-empty lines (might be continuation or other info)
-                        formatted_lines.append(line)
-                
-                output += '\n'.join(formatted_lines)
-            else:
-                if err:
-                    error_msg = err.decode('utf-8', errors='ignore')
-                    if "iptables" in error_msg.lower() or "command not found" in error_msg.lower():
-                        output += "iptables not available or not installed\n"
+
+            if proc.returncode != 0:
+                error_msg = err.decode('utf-8', errors='ignore') if err else "Unknown error"
+                output += "Failed to get iptables rules: {}\n".format(error_msg)
+                output += "\n"
+                print(output)
+                return 1, None
+
+            lines = out.decode('utf-8', errors='ignore').split('\n') if out else []
+            acl_entries = []
+            for line in lines:
+                if not line.startswith("-A INPUT"):
+                    continue
+                if ACL_COMMENT_PREFIX.strip() not in line:
+                    continue
+                if "-d {}".format(dest_cidr) not in line:
+                    continue
+
+                target_match = re.search(r"-j\s+(ACCEPT|DROP)", line)
+                action = "allow" if target_match and target_match.group(1) == "ACCEPT" else "deny"
+
+                source_match = re.search(r"-s\s+(\S+)", line)
+                source = source_match.group(1) if source_match else "0.0.0.0/0"
+
+                port_match = re.search(r"--dport\s+(\d+)", line)
+                port = port_match.group(1) if port_match else "all"
+
+                comment_match = re.search(r'--comment\s+"([^"]+)"', line)
+                desc = ""
+                if comment_match:
+                    raw_comment = comment_match.group(1)
+                    desc = raw_comment.replace(ACL_COMMENT_PREFIX, "", 1).strip()
+
+                acl_entries.append((action, source, port, desc))
+
+            if acl_entries:
+                for action, source, port, desc in acl_entries:
+                    if desc:
+                        output += "  {} {} {} ({})\n".format(action, source, port, desc)
                     else:
-                        output += "Failed to get iptables rules: {}\n".format(error_msg)
-                else:
-                    output += "No iptables rules found\n"
-            
+                        output += "  {} {} {}\n".format(action, source, port)
+            else:
+                output += "  No AELLA_ACL rules found\n"
+
             output += "\n"
             print(output)
             return 0, output
@@ -1584,9 +1468,46 @@ class AellaCli(cmd.Cmd, object):
 
         # Reuse existing validation and implementation by calling set_interface_callback2
         # which edits /etc/network/interfaces. For restart, keep existing restart logic.
+        tokens = [t for t in param[1:]]
+        keywords = [t.lower() for t in tokens if t.lower() in {"ip", "gateway", "dns", "restart"}]
+        if len(keywords) > 1 or ("restart" in keywords and len(tokens) > 1):
+            try:
+                parsed = self._parse_set_interface_args(tokens)
+            except ValueError as e:
+                print('{}\n'.format(e))
+                return
+            if parsed["ip"]:
+                if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
+                    print('\n<IP Address/Netmask>   Specify interface IP address and netmask\n')
+                    return
+            if parsed["gateway"]:
+                if not self.valid_ipv4_address(parsed["gateway"]) or '/' in parsed["gateway"]:
+                    print('\n<IP Address>      Specify default gateway IP address\n')
+                    return
+            if parsed["dns"]:
+                for d in parsed["dns"]:
+                    if not self.valid_ipv4_address(d):
+                        print('Invalid DNS server IP address format: {0}\n'.format(d))
+                        return
+
+            if not self._apply_interface_config(
+                interface,
+                ip=parsed["ip"],
+                gateway=parsed["gateway"],
+                dns_list=parsed["dns"],
+            ):
+                return
+            if parsed["restart"]:
+                print('Restarting network interface. You need to use new IP address to reconnect...\n')
+                if not self._restart_interface_with_verification(interface):
+                    return
+            else:
+                print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
+            return
+
         if option == 'restart':
             print('Restarting network interface. You need to use new IP address to reconnect...\n')
-            self.restart_new_network_manager(interface)
+            self._restart_interface_with_verification(interface)
             return
 
         # Minimal validation (use existing helper)
@@ -1640,7 +1561,7 @@ class AellaCli(cmd.Cmd, object):
 
         if option == 'restart':
             print('Restarting network interface. You need to use new IP address to reconnect...\n')
-            self.restart_new_network_manager(interface)
+            self._restart_interface_with_verification(interface)
             return
 
         # Use existing unset logic but without DP-only restrictions by temporarily bypassing checks
@@ -1720,6 +1641,18 @@ class AellaCli(cmd.Cmd, object):
         if key:
             self.shell_cmd_exec('sudo virsh list --all')
 
+    @staticmethod
+    def _parse_virsh_autostart(dominfo_text: str) -> Optional[bool]:
+        for line in dominfo_text.splitlines():
+            if line.lower().startswith("autostart:"):
+                raw_value = line.split(":", 1)[1].strip().lower()
+                if raw_value in {"enable", "enabled", "yes", "on", "1"}:
+                    return True
+                if raw_value in {"disable", "disabled", "no", "off", "0"}:
+                    return False
+                return None
+        return None
+
     def show_autostart_callback(self, key, param):
         """Show VM auto start configuration"""
         vm_list = self.get_vm_list()
@@ -1731,13 +1664,16 @@ class AellaCli(cmd.Cmd, object):
         print('-' * 50)
         for vm in sorted(vm_list):
             try:
-                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'autostart'".format(vm)
+                cmd = "virsh dominfo {} 2>/dev/null".format(vm)
                 proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, err = proc.communicate()
-                if out and 'enabled' in out.decode('utf-8', errors='ignore').lower():
-                    status = 'enabled'
-                else:
-                    status = 'disabled'
+                status = 'unknown'
+                if out:
+                    parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
+                    if parsed is True:
+                        status = 'enabled'
+                    elif parsed is False:
+                        status = 'disabled'
                 print('  {:<20} {}'.format(vm, status))
             except Exception:
                 print('  {:<20} unknown'.format(vm))
@@ -2196,6 +2132,19 @@ class AellaCli(cmd.Cmd, object):
         """Return only the approved always-allow destination IPs"""
         return ["127.0.0.1", "192.168.0.100"]
 
+    def _get_mgt_ipv4(self) -> str:
+        cmd = "ip -4 addr show dev mgt"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if proc.returncode != 0 or not out:
+            err_msg = err.decode("utf-8", errors="ignore").strip() if err else "mgt IPv4 not found"
+            raise RuntimeError("Failed to get mgt IPv4 address: {}".format(err_msg))
+        output = out.decode("utf-8", errors="ignore")
+        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", output)
+        if not match:
+            raise RuntimeError("Failed to parse mgt IPv4 address")
+        return match.group(1)
+
     def _ensure_local_ip_allow_rules(self):
         """Ensure local interface IPs are always allowed"""
         for dest_ip in ALWAYS_ALLOW_DEST_IPS:
@@ -2211,6 +2160,17 @@ class AellaCli(cmd.Cmd, object):
                     "sudo iptables -I INPUT 1 -d {} -m comment --comment \"{}\" -j ACCEPT"
                 ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
                 subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+    def _ensure_established_related_rule(self):
+        cmd_check = "sudo iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        proc = subprocess.Popen(cmd_check, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.communicate()
+        if proc.returncode != 0:
+            cmd_add = (
+                "sudo iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED "
+                "-j ACCEPT -m comment --comment \"AELLA_SYSTEM Allow established\""
+            )
+            subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
     def _purge_legacy_local_always_allow_rules(self):
         """
@@ -2380,6 +2340,10 @@ class AellaCli(cmd.Cmd, object):
             except Exception:
                 pass
 
+    def _clear_acl_staging(self):
+        """Clear staged ACL rules"""
+        self._save_acl_staging({"rules": []})
+
     def _stage_rule(self, action, source, ports, desc):
         """Stage a rule in ACL staging file, avoid duplicates"""
         data = self._load_acl_staging()
@@ -2405,6 +2369,8 @@ class AellaCli(cmd.Cmd, object):
 
     def _iptables_add(self, action, source, ports, desc):
         """Add ACL rules to iptables with comment prefix"""
+        mgt_ip = self._get_mgt_ipv4()
+        dest_part = "-d {}/32".format(mgt_ip)
         comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
         escaped_comment = comment_value.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
         comment_part = '-m comment --comment "{}"'.format(escaped_comment)
@@ -2414,33 +2380,33 @@ class AellaCli(cmd.Cmd, object):
             if port == 'all':
                 if action == 'allow':
                     if any_source:
-                        cmd = "sudo iptables -I INPUT {} -j ACCEPT".format(comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -j ACCEPT"
+                        cmd = "sudo iptables -I INPUT {} {} -j ACCEPT".format(dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 {} -j ACCEPT".format(dest_part)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} {} -j ACCEPT".format(source, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -j ACCEPT".format(source)
+                        cmd = "sudo iptables -I INPUT -s {} {} {} -j ACCEPT".format(source, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} {} -j ACCEPT".format(source, dest_part)
                 else:
                     if any_source:
-                        cmd = "sudo iptables -I INPUT {} -j DROP".format(comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -j DROP"
+                        cmd = "sudo iptables -I INPUT {} {} -j DROP".format(dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 {} -j DROP".format(dest_part)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} {} -j DROP".format(source, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -j DROP".format(source)
+                        cmd = "sudo iptables -I INPUT -s {} {} {} -j DROP".format(source, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} {} -j DROP".format(source, dest_part)
             else:
                 if action == 'allow':
                     if any_source:
-                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} -j ACCEPT".format(port, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} -j ACCEPT".format(port)
+                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j ACCEPT".format(port, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} {} -j ACCEPT".format(port, dest_part)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j ACCEPT".format(source, port)
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j ACCEPT".format(source, port, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, dest_part)
                 else:
                     if any_source:
-                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} -j DROP".format(port, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} -j DROP".format(port)
+                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j DROP".format(port, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} {} -j DROP".format(port, dest_part)
                     else:
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} -j DROP".format(source, port)
+                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j DROP".format(source, port, dest_part, comment_part).strip()
+                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, dest_part)
 
             check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             check_proc.communicate()
@@ -2449,10 +2415,12 @@ class AellaCli(cmd.Cmd, object):
 
             if any_source:
                 if port == 'all':
-                    alt_check_cmd = "sudo iptables -C INPUT -j {}".format("ACCEPT" if action == "allow" else "DROP")
+                    alt_check_cmd = "sudo iptables -C INPUT {} -j {}".format(
+                        dest_part, "ACCEPT" if action == "allow" else "DROP"
+                    )
                 else:
-                    alt_check_cmd = "sudo iptables -C INPUT -p tcp --dport {} -j {}".format(
-                        port, "ACCEPT" if action == "allow" else "DROP"
+                    alt_check_cmd = "sudo iptables -C INPUT -p tcp --dport {} {} -j {}".format(
+                        port, dest_part, "ACCEPT" if action == "allow" else "DROP"
                     )
                 alt_proc = subprocess.Popen(alt_check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 alt_proc.communicate()
@@ -2467,24 +2435,52 @@ class AellaCli(cmd.Cmd, object):
                     cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
                     subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
+    def _iptables_rule_exists(self, action, source, port, mgt_ip=None):
+        """Check if a semantically equivalent rule already exists via iptables -C"""
+        target = "ACCEPT" if action == "allow" else "DROP"
+        any_source = source in ("0.0.0.0/0", "0.0.0.0")
+        if not mgt_ip:
+            mgt_ip = self._get_mgt_ipv4()
+        dest_part = "-d {}/32".format(mgt_ip)
+
+        base_parts = ["sudo iptables -C INPUT", dest_part]
+        if port != "all":
+            base_parts.append("-p tcp --dport {}".format(port))
+        base_parts.append("-j {}".format(target))
+        base_cmd = " ".join(base_parts)
+
+        if not any_source:
+            check_cmd = "{} -s {}".format(base_cmd, source)
+            proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc.communicate()
+            return proc.returncode == 0
+
+        check_cmds = [
+            "{} -s 0.0.0.0/0".format(base_cmd),
+            base_cmd,
+        ]
+        for check_cmd in check_cmds:
+            proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc.communicate()
+            if proc.returncode == 0:
+                return True
+        return False
+
     def _iptables_delete_user_rules(self):
         """Delete user ACL rules with AELLA_ACL prefix from INPUT chain"""
-        cmd = "sudo iptables -L INPUT -n --line-numbers"
+        cmd = "sudo iptables -S INPUT"
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, _ = proc.communicate()
         if proc.returncode != 0 or not out:
             return
 
         lines = out.decode('utf-8', errors='ignore').split('\n')
-        line_nums_to_remove = []
         for line in lines:
-            if ACL_COMMENT_PREFIX.strip() in line:
-                match = re.match(r'^\s*(\d+)\s+', line)
-                if match:
-                    line_nums_to_remove.append(match.group(1))
-
-        for line_num in sorted(line_nums_to_remove, key=int, reverse=True):
-            del_cmd = "sudo iptables -D INPUT {}".format(line_num)
+            if not line.startswith("-A INPUT"):
+                continue
+            if ACL_COMMENT_PREFIX.strip() not in line:
+                continue
+            del_cmd = "sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1)
             subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
     def set_acl_callback(self, key, param):
@@ -2523,6 +2519,7 @@ class AellaCli(cmd.Cmd, object):
                 reset = True
 
             self._ensure_default_accept_policy()
+            self._ensure_established_related_rule()
 
             data = self._load_acl_staging()
             rules = data.get("rules", [])
@@ -2535,18 +2532,29 @@ class AellaCli(cmd.Cmd, object):
             if ssh_ip:
                 self._iptables_add_auto_ssh(ssh_ip)
 
+            try:
+                mgt_ip = self._get_mgt_ipv4()
+            except Exception as e:
+                print('Failed to apply ACL rules: {}\n'.format(e))
+                return
+
             for rule in rules:
                 action = rule.get("action")
                 source = rule.get("source")
                 ports = rule.get("ports", [])
                 desc = rule.get("desc", "")
                 if action in ['allow', 'deny'] and source and ports:
-                    self._iptables_add(action, source, ports, desc)
+                    for port in ports:
+                        if self._iptables_rule_exists(action, source, port, mgt_ip=mgt_ip):
+                            continue
+                        self._iptables_add(action, source, [port], desc)
 
             if reset:
                 print('Applied staged ACL rules with reset (rebuild completed).\n')
             else:
                 print('Applied staged ACL rules (merge completed).\n')
+            self._clear_acl_staging()
+            print('Staging cleared.\n')
             return
 
         if len(param) < 3:
@@ -2813,15 +2821,17 @@ class AellaCli(cmd.Cmd, object):
             staged_removed_count = 0
 
             # Load current rules once for live deletion
+            mgt_ip = self._get_mgt_ipv4()
+            dest_cidr = "{}/32".format(mgt_ip)
             cmd = "sudo iptables -S INPUT"
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
             rule_lines = out.decode('utf-8', errors='ignore').split('\n') if out else []
 
             def _is_excluded_rule(rule_line):
-                if "AELLA_LOCAL_ALWAYS_ALLOW" in rule_line:
+                if ACL_COMMENT_PREFIX.strip() not in rule_line:
                     return True
-                if "Local interface IP - always allow" in rule_line:
+                if "-d {}".format(dest_cidr) not in rule_line:
                     return True
                 return False
 
@@ -2833,15 +2843,17 @@ class AellaCli(cmd.Cmd, object):
                     for line in rule_lines:
                         if not line.startswith("-A INPUT"):
                             continue
+                        if "-j ACCEPT" not in line and "-j DROP" not in line:
+                            continue
                         if any_source:
-                            if "-s 0.0.0.0/0" not in line and " -s " in line:
+                            if "-s " in line and "-s 0.0.0.0/0" not in line:
                                 continue
                         else:
                             if "-s {}".format(source) not in line:
                                 continue
                         if _is_excluded_rule(line):
                             continue
-                        delete_cmds.append(line.replace("-A INPUT", "sudo iptables -D INPUT", 1))
+                        delete_cmds.append("sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1))
                 else:
                     # Validate port number
                     try:
@@ -2855,8 +2867,10 @@ class AellaCli(cmd.Cmd, object):
                     for line in rule_lines:
                         if not line.startswith("-A INPUT"):
                             continue
+                        if "-j ACCEPT" not in line and "-j DROP" not in line:
+                            continue
                         if any_source:
-                            if "-s 0.0.0.0/0" not in line and " -s " in line:
+                            if "-s " in line and "-s 0.0.0.0/0" not in line:
                                 continue
                         else:
                             if "-s {}".format(source) not in line:
@@ -2865,7 +2879,7 @@ class AellaCli(cmd.Cmd, object):
                             continue
                         if _is_excluded_rule(line):
                             continue
-                        delete_cmds.append(line.replace("-A INPUT", "sudo iptables -D INPUT", 1))
+                        delete_cmds.append("sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1))
 
             for del_cmd in delete_cmds:
                 del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2994,7 +3008,7 @@ class AellaCli(cmd.Cmd, object):
 
         elif option == 'restart':
              print('Restarting network interface. You need to use new IP address to reconnect...\n')
-             self.restart_new_network_manager(interface)
+             self._restart_interface_with_verification(interface)
 
     def complete_unset(self, text, line, begidx, endidx):
         if not text:
@@ -3155,17 +3169,18 @@ class AellaCli(cmd.Cmd, object):
         # If enable/disable not specified, check current state and toggle
         if enable is None:
             try:
-                cmd = "virsh dominfo {} | grep -i 'autostart'".format(vm_name)
+                cmd = "virsh dominfo {} 2>/dev/null".format(vm_name)
                 proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, err = proc.communicate()
                 if out:
-                    # Check if autostart is enabled
-                    if 'enabled' in out.decode('utf-8', errors='ignore').lower():
-                        enable = False  # Toggle to disable
+                    parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
+                    if parsed is True:
+                        enable = False
+                    elif parsed is False:
+                        enable = True
                     else:
-                        enable = True   # Toggle to enable
+                        enable = True
                 else:
-                    # If we can't determine, default to enable
                     enable = True
             except Exception:
                 # If check fails, default to enable
@@ -3175,18 +3190,25 @@ class AellaCli(cmd.Cmd, object):
         try:
             if enable:
                 cmd = "virsh autostart {}".format(vm_name)
-                result = subprocess.call(cmd, shell=True)
-                if result == 0:
-                    print("VM '{}' auto start enabled successfully.\n".format(vm_name))
-                else:
-                    print("Failed to enable auto start for VM '{}'.\n".format(vm_name))
             else:
                 cmd = "virsh autostart --disable {}".format(vm_name)
-                result = subprocess.call(cmd, shell=True)
-                if result == 0:
-                    print("VM '{}' auto start disabled successfully.\n".format(vm_name))
-                else:
-                    print("Failed to disable auto start for VM '{}'.\n".format(vm_name))
+            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                err_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, err_msg))
+                return
+
+            check_cmd = "virsh dominfo {} 2>/dev/null".format(vm_name)
+            check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, _ = check_proc.communicate()
+            status = 'unknown'
+            if out:
+                parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
+                if parsed is True:
+                    status = 'enabled'
+                elif parsed is False:
+                    status = 'disabled'
+            print("VM '{}' auto start status: {}\n".format(vm_name, status))
         except Exception as e:
             print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, e))
 
@@ -3786,6 +3808,187 @@ class AellaCli(cmd.Cmd, object):
             netmask = ""
         return address, netmask
 
+    def _parse_set_interface_args(self, tokens):
+        parsed = {"ip": None, "gateway": None, "dns": [], "restart": False}
+        i = 0
+        while i < len(tokens):
+            key = tokens[i].lower()
+            if key == "restart":
+                parsed["restart"] = True
+                i += 1
+                continue
+            if key not in {"ip", "gateway", "dns"}:
+                raise ValueError("Invalid option: {}".format(tokens[i]))
+            if i + 1 >= len(tokens):
+                raise ValueError("Missing value for {}".format(tokens[i]))
+            if key == "ip":
+                parsed["ip"] = tokens[i + 1]
+                i += 2
+            elif key == "gateway":
+                parsed["gateway"] = tokens[i + 1]
+                i += 2
+            else:
+                dns_list = []
+                i += 1
+                while i < len(tokens) and tokens[i].lower() not in {"ip", "gateway", "dns", "restart"}:
+                    dns_list.append(tokens[i])
+                    i += 1
+                if not dns_list:
+                    raise ValueError("Missing DNS server IP address")
+                parsed["dns"] = dns_list
+        return parsed
+
+    def _read_interface_config_lines(self, interface):
+        interface_in_main = False
+        main_path = "/etc/network/interfaces"
+        if os.path.exists(main_path):
+            with open(main_path, 'r') as f:
+                for line in f:
+                    if re.match(r'^\s*(auto|iface)\s+{}\s+'.format(re.escape(interface)), line):
+                        interface_in_main = True
+                        break
+        if interface in ("data1g", "data10g") and not interface_in_main:
+            candidate = "/etc/network/interfaces.d/01-data1g.cfg" if interface == "data1g" else "/etc/network/interfaces.d/10-data10g.cfg"
+            if os.path.exists(candidate):
+                with open(candidate, 'r') as f:
+                    return f.readlines()
+            return []
+        if os.path.exists(main_path):
+            with open(main_path, 'r') as f:
+                return f.readlines()
+        return []
+
+    def _get_interface_expected_config(self, interface):
+        lines = self._read_interface_config_lines(interface)
+        in_block = False
+        address = None
+        dns_list = []
+        for line in lines:
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                in_block = True
+            elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                in_block = False
+            if not in_block:
+                continue
+            addr_match = re.match(r'^\s*address\s+(\S+)', line)
+            if addr_match:
+                address = addr_match.group(1)
+            dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
+            if dns_match:
+                dns_list = [d for d in dns_match.group(1).strip().split() if self.valid_ipv4_address(d)]
+        return address, dns_list
+
+    def _apply_interface_config(self, interface, ip=None, gateway=None, dns_list=None):
+        lines = self._read_interface_config_lines(interface)
+        if dns_list is None:
+            dns_list = []
+
+        start = None
+        end = None
+        in_block = False
+        for idx, line in enumerate(lines):
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                if start is None:
+                    start = idx
+                    in_block = True
+            elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                end = idx
+                in_block = False
+                break
+        if start is not None and end is None:
+            end = len(lines)
+
+        existing_auto = False
+        existing_mode = None
+        existing_address = None
+        existing_netmask = None
+        existing_gateway = None
+        existing_dns = []
+        other_lines = []
+
+        if start is not None:
+            block_lines = lines[start:end]
+            for line in block_lines:
+                if re.match(r'^\s*auto\s+{}\b'.format(re.escape(interface)), line):
+                    existing_auto = True
+                    continue
+                iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(interface)), line)
+                if iface_match:
+                    existing_mode = iface_match.group(1)
+                    continue
+                addr_match = re.match(r'^\s*address\s+(\S+)', line)
+                if addr_match:
+                    existing_address = addr_match.group(1)
+                    continue
+                netmask_match = re.match(r'^\s*netmask\s+(\S+)', line)
+                if netmask_match:
+                    existing_netmask = netmask_match.group(1)
+                    continue
+                gw_match = re.match(r'^\s*gateway\s+(\S+)', line)
+                if gw_match:
+                    existing_gateway = gw_match.group(1)
+                    continue
+                dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
+                if dns_match:
+                    existing_dns = [d for d in dns_match.group(1).strip().split() if self.valid_ipv4_address(d)]
+                    continue
+                other_lines.append(line.rstrip())
+
+        if ip:
+            new_address, new_netmask = self.cidr_to_netmask(ip)
+            if not new_address or not new_netmask:
+                print('Invalid IP address format: {}'.format(ip))
+                return False
+            mode = "static"
+        else:
+            new_address = existing_address
+            new_netmask = existing_netmask
+            mode = existing_mode or "static"
+
+        new_gateway = gateway if gateway is not None else existing_gateway
+        new_dns = dns_list if dns_list else existing_dns
+
+        if start is None and not ip and (new_gateway or new_dns):
+            print('IP address is required to create a new interface configuration\n')
+            return False
+
+        if mode == "static" and not new_address:
+            print('IP address is required for static configuration\n')
+            return False
+
+        new_block = []
+        if existing_auto or start is None:
+            new_block.append("auto {}".format(interface))
+        new_block.append("iface {} inet {}".format(interface, mode))
+
+        if mode != "dhcp":
+            if new_address:
+                new_block.append("address {}".format(new_address))
+            if new_netmask:
+                new_block.append("netmask {}".format(new_netmask))
+            if new_gateway:
+                new_block.append("gateway {}".format(new_gateway))
+        if new_dns:
+            new_block.append("dns-nameservers {}".format(" ".join(new_dns)))
+
+        for line in other_lines:
+            if line:
+                new_block.append(line)
+
+        if start is None:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = lines[-1] + "\n"
+            new_lines = [l.rstrip("\n") for l in lines]
+            if new_lines and new_lines[-1].strip():
+                new_lines.append("")
+            new_lines.extend(new_block)
+        else:
+            new_lines = [l.rstrip("\n") for l in lines[:start]] + new_block + [l.rstrip("\n") for l in lines[end:]]
+
+        if not self.update_interface_file(interface, new_lines):
+            return False
+        return True
+
     def set_interface_callback2(self, param):
         status = 0
         output = None
@@ -4000,11 +4203,11 @@ class AellaCli(cmd.Cmd, object):
             if not self.update_interface_file(interface, contents):
                 status = 1
                 return
-            self.update_resolve_conf(new_dns_server)
             if field.lower() == "restart":
                 print('Restarting network interface. You need to use new IP address to reconnect...\n')
-                #self.restart_network_manager(interface, new_address, new_netmask, new_gateway)
-                self.restart_new_network_manager(interface)
+                if not self._restart_interface_with_verification(interface):
+                    status = 1
+                    return
             if not (field.lower() == "restart"): 
                 print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
 
@@ -4080,35 +4283,50 @@ class AellaCli(cmd.Cmd, object):
 
         elif require_interface_restart:
              print("Restarting network interface. You need to use new IP address to reconnect...\n")
-             self.restart_new_network_manager(interface)
+             self._restart_interface_with_verification(interface)
 
         if not (field.lower() == "restart"):
              print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
 
         return None
 
-    # Update resolve.conf
-    def update_resolve_conf(self, dns_server):
-        if dns_server == "":
-            return True
-        try:
-            write_f = open("/etc/resolv.conf", 'w')
-            write_f.write("nameserver {0}\n".format(dns_server))
-            write_f.close()
-            return True
-        except Exception:
-            print("Failed to write to resolv.conf")
+    def _restart_interface_with_verification(self, interface):
+        expected_ip, expected_dns = self._get_interface_expected_config(interface)
+        if not self.restart_new_network_manager(interface, expected_ip=expected_ip, expected_dns=expected_dns):
             return False
+        print("Restart completed.\n")
+        return True
 
-    @staticmethod
-    def restart_new_network_manager(interface, gw=True):
+    def restart_new_network_manager(self, interface, expected_ip=None, expected_dns=None):
         try:
-            cmd = "( rm -f /run/resolvconf/interface/{0}.dhclient && ip address flush dev {0} && ifdown {0} 2> /dev/null && ifup {0} 2>/dev/null )&".format(interface)
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            proc.communicate()
+            cmd = "rm -f /run/resolvconf/interface/{0}.dhclient && ip address flush dev {0} && ifdown {0} 2> /dev/null && ifup {0} 2>/dev/null".format(interface)
+            proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                err_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
+                print("Failed to restart networking! {}".format(err_msg))
+                return False
         except Exception as e:
             print("Failed to restart networking! {}".format(e))
             return False
+
+        if expected_ip:
+            check_proc = subprocess.run(
+                "ip -4 addr show dev {}".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if check_proc.returncode != 0 or expected_ip not in check_proc.stdout:
+                print("Failed to verify IP address on {} after restart".format(interface))
+                return False
+
+        if expected_dns:
+            current_dns = self._get_interface_expected_config(interface)[1]
+            if not set(expected_dns).issubset(set(current_dns)):
+                print("Failed to verify DNS settings on {} after restart".format(interface))
+                return False
+
         return True
 
     # Restart network manager to make configuration active
@@ -4227,6 +4445,51 @@ class AellaCli(cmd.Cmd, object):
 
         if not self.is_device_exist(interface):
            return
+
+        tokens = [t for t in param[1:]]
+        keywords = [t.lower() for t in tokens if t.lower() in {"ip", "gateway", "dns", "restart"}]
+        if len(keywords) > 1 or ("restart" in keywords and len(tokens) > 1):
+            try:
+                parsed = self._parse_set_interface_args(tokens)
+            except ValueError as e:
+                print('{}\n'.format(e))
+                return
+
+            if parsed["ip"]:
+                if parsed["ip"] == 'dhcp':
+                    print("Invalid ip option: DHCP client is not supported")
+                    return
+                if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
+                    print('Invalid IP address format: {0}'.format(parsed["ip"]))
+                    return
+            if parsed["gateway"]:
+                if not self.valid_ipv4_address(parsed["gateway"]) or '/' in parsed["gateway"]:
+                    print('Invalid gateway IP address format: {0}'.format(parsed["gateway"]))
+                    return
+            if parsed["dns"]:
+                if interface != 'mgt':
+                    print('Invalid option: Only "mgt" interface support dns option')
+                    return
+                for dns in parsed["dns"]:
+                    if not self.valid_ipv4_address(dns):
+                        print('Invalid DNS server IP address format: {0}'.format(dns))
+                        return
+
+            if not self._apply_interface_config(
+                interface,
+                ip=parsed["ip"],
+                gateway=parsed["gateway"],
+                dns_list=parsed["dns"],
+            ):
+                return
+
+            if parsed["restart"]:
+                print('Restarting network interface. You need to use new IP address to reconnect...\n')
+                if not self._restart_interface_with_verification(interface):
+                    return
+            else:
+                print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
+            return
 
         if option != 'ip' and option != 'gateway' and option != 'dns' and option != 'restart':
             print('Invalid option: {0}'.format(option))
