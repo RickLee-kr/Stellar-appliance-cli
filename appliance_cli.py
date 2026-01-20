@@ -2193,53 +2193,8 @@ class AellaCli(cmd.Cmd, object):
         print("DNS servers configured for interface {}. Run 'set interface {} restart' to apply.\n".format(interface, interface))
 
     def _get_local_interface_ips(self):
-        """Get all local interface IP addresses"""
-        local_ips = []
-        try:
-            # Get IP addresses from ip command
-            cmd = "ip -4 addr show | grep -oP 'inet \K[\d.]+'"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, _ = proc.communicate()
-            if out:
-                local_ips = out.decode('utf-8', errors='ignore').strip().split('\n')
-                local_ips = [ip.strip() for ip in local_ips if ip.strip()]
-        except Exception:
-            pass
-        
-        # Also check /etc/network/interfaces and interfaces.d/*.cfg
-        try:
-            interfaces_file = "/etc/network/interfaces"
-            if os.path.exists(interfaces_file):
-                with open(interfaces_file, 'r') as f:
-                    for line in f:
-                        match = re.match(r'^\s*address\s+(\S+)', line)
-                        if match:
-                            ip = match.group(1)
-                            if self.valid_ipv4_address(ip) and ip not in local_ips:
-                                local_ips.append(ip)
-        except Exception:
-            pass
-        
-        try:
-            interfaces_d_dir = "/etc/network/interfaces.d"
-            if os.path.exists(interfaces_d_dir):
-                for filename in os.listdir(interfaces_d_dir):
-                    if filename.endswith('.cfg'):
-                        filepath = os.path.join(interfaces_d_dir, filename)
-                        try:
-                            with open(filepath, 'r') as f:
-                                for line in f:
-                                    match = re.match(r'^\s*address\s+(\S+)', line)
-                                    if match:
-                                        ip = match.group(1)
-                                        if self.valid_ipv4_address(ip) and ip not in local_ips:
-                                            local_ips.append(ip)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        
-        return local_ips
+        """Return only the approved always-allow destination IPs"""
+        return ["127.0.0.1", "192.168.0.100"]
 
     def _ensure_local_ip_allow_rules(self):
         """Ensure local interface IPs are always allowed"""
@@ -2256,6 +2211,44 @@ class AellaCli(cmd.Cmd, object):
                     "sudo iptables -I INPUT 1 -d {} -m comment --comment \"{}\" -j ACCEPT"
                 ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
                 subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+    def _purge_legacy_local_always_allow_rules(self):
+        """
+        Remove legacy destination-based allow rules that bypass deny-all:
+          ACCEPT all 0.0.0.0/0 -> <host_ip> /* Local interface IP - always allow */
+        Keep only 127.0.0.1 and 192.168.0.100 if such legacy rules exist.
+        """
+        keep = {"127.0.0.1", "192.168.0.100"}
+        cmd = "sudo iptables -L INPUT -n -v --line-numbers"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate()
+        if proc.returncode != 0 or not out:
+            return
+
+        lines = out.decode("utf-8", errors="ignore").splitlines()
+        to_delete = []
+        for line in lines:
+            if "Local interface IP - always allow" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            try:
+                num = int(parts[0])
+            except Exception:
+                continue
+            dest = parts[9] if len(parts) > 9 else ""
+            if dest in keep:
+                continue
+            to_delete.append(num)
+
+        for num in sorted(to_delete, reverse=True):
+            subprocess.Popen(
+                "sudo iptables -D INPUT {}".format(num),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).communicate()
 
     def _get_current_ssh_client_ip(self):
         """Get current SSH client IPv4 address if available"""
@@ -2506,6 +2499,7 @@ class AellaCli(cmd.Cmd, object):
             rules = data.get("rules", [])
             if reset:
                 self._iptables_delete_user_rules()
+                self._purge_legacy_local_always_allow_rules()
 
             self._ensure_local_ip_allow_rules()
             ssh_ip = self._get_current_ssh_client_ip()
