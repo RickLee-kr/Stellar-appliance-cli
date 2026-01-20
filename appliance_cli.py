@@ -2780,40 +2780,34 @@ class AellaCli(cmd.Cmd, object):
         
         try:
             # Remove iptables rules
-            rules_removed = []
+            live_removed_count = 0
+            staged_removed_count = 0
+
+            # Load current rules once for live deletion
+            cmd = "sudo iptables -S INPUT"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            rule_lines = out.decode('utf-8', errors='ignore').split('\n') if out else []
+
+            def _is_excluded_rule(rule_line):
+                if "AELLA_LOCAL_ALWAYS_ALLOW" in rule_line:
+                    return True
+                if "Local interface IP - always allow" in rule_line:
+                    return True
+                return False
+
+            # Build deletion commands from rule specs
+            delete_cmds = []
             for port in ports:
                 if port == 'all':
-                    # Remove all rules for this source (both ACCEPT and DROP, all ports)
-                    # Get all rules matching the source, but exclude local IP rules
-                    cmd = "sudo iptables -L INPUT -n --line-numbers"
-                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out, err = proc.communicate()
-                    if out:
-                        lines = out.decode('utf-8', errors='ignore').split('\n')
-                        line_nums_to_remove = []
-                        for line in lines:
-                            if re.match(r'^\s*(\d+)', line):
-                                line_num = re.match(r'^\s*(\d+)', line).group(1)
-                                # Check if this line matches the source and is not a local IP rule
-                                if source in line:
-                                    # Check if it's a local IP rule (destination rule)
-                                    is_local_rule = False
-                                    for local_ip in local_ips:
-                                        if '-d {}'.format(local_ip) in line:
-                                            is_local_rule = True
-                                            break
-                                    if not is_local_rule:
-                                        line_nums_to_remove.append(line_num)
-                        
-                        # Remove in reverse order to maintain line numbers
-                        for line_num in reversed(line_nums_to_remove):
-                            if line_num.isdigit():
-                                del_cmd = "sudo iptables -D INPUT {}".format(line_num)
-                                del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                del_proc.communicate()
-                                if del_proc.returncode == 0:
-                                    if (source, port) not in rules_removed:
-                                        rules_removed.append((source, port))
+                    for line in rule_lines:
+                        if not line.startswith("-A INPUT"):
+                            continue
+                        if "-s {}".format(source) not in line:
+                            continue
+                        if _is_excluded_rule(line):
+                            continue
+                        delete_cmds.append(line.replace("-A INPUT", "sudo iptables -D INPUT", 1))
                 else:
                     # Validate port number
                     try:
@@ -2824,24 +2818,62 @@ class AellaCli(cmd.Cmd, object):
                     except ValueError:
                         print('Invalid port number: {}\n'.format(port))
                         continue
-                    
-                    # Try to remove both ACCEPT and DROP rules for specific port
-                    for target in ['ACCEPT', 'DROP']:
-                        # Use iptables -D with rule specification
-                        del_cmd = "sudo iptables -D INPUT -s {} -p tcp --dport {} -j {}".format(source, port_num, target)
-                        del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        del_proc.communicate()
-                        if del_proc.returncode == 0:
-                            rules_removed.append((source, port))
-                            break
-            
-            if rules_removed:
-                print('Successfully removed ACL rules:\n')
-                for source, port in rules_removed:
-                    print('  {} {}\n'.format(source, port))
-                
-                # Ensure default policy is ACCEPT if no user-defined rules remain
-                self._ensure_default_accept_policy()
+                    for line in rule_lines:
+                        if not line.startswith("-A INPUT"):
+                            continue
+                        if "-s {}".format(source) not in line:
+                            continue
+                        if "--dport {}".format(port_num) not in line:
+                            continue
+                        if _is_excluded_rule(line):
+                            continue
+                        delete_cmds.append(line.replace("-A INPUT", "sudo iptables -D INPUT", 1))
+
+            for del_cmd in delete_cmds:
+                del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                del_proc.communicate()
+                if del_proc.returncode == 0:
+                    live_removed_count += 1
+
+            # Update staging rules
+            staging = self._load_acl_staging()
+            rules = staging.get("rules", [])
+            new_rules = []
+            for rule in rules:
+                rule_source = rule.get("source")
+                rule_ports = rule.get("ports", [])
+                if rule_source != source:
+                    new_rules.append(rule)
+                    continue
+
+                normalized_ports = [str(p) for p in rule_ports]
+                if "all" in normalized_ports:
+                    staged_removed_count += 1
+                    continue
+                if ports == ['all']:
+                    staged_removed_count += 1
+                    continue
+
+                keep_ports = [p for p in normalized_ports if p not in [str(pv) for pv in ports]]
+                if not keep_ports:
+                    staged_removed_count += 1
+                    continue
+
+                if keep_ports != normalized_ports:
+                    rule["ports"] = keep_ports
+                    staged_removed_count += 1
+                new_rules.append(rule)
+
+            if new_rules != rules:
+                staging["rules"] = new_rules
+                self._save_acl_staging(staging)
+
+            if live_removed_count or staged_removed_count:
+                print('Removed {} live rule(s), removed {} staged rule(s).\n'.format(
+                    live_removed_count, staged_removed_count
+                ))
+                if live_removed_count:
+                    self._ensure_default_accept_policy()
             else:
                 print('No matching ACL rules found to remove.\n')
                 print('Use "show acl" to see current rules.\n')
