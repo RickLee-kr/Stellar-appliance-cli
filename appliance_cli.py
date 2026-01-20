@@ -1484,6 +1484,13 @@ class AellaCli(cmd.Cmd, object):
                 print('{}\n'.format(e))
                 return
             if parsed["ip"]:
+                if '/' not in parsed["ip"] and self.valid_ipv4_address(parsed["ip"]):
+                    current_netmask = self._get_interface_netmask(interface)
+                    if current_netmask:
+                        parsed["ip"] = "{}/{}".format(parsed["ip"], current_netmask)
+                    else:
+                        print('Please specify network mask: {0}\n'.format(parsed["ip"]))
+                        return
                 if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
                     print('\n<IP Address/Netmask>   Specify interface IP address and netmask\n')
                     return
@@ -3745,10 +3752,34 @@ class AellaCli(cmd.Cmd, object):
                 return True
             else:
                 # mgt or any interface in main file (Sensor/AIO installer format)
-                with open("/etc/network/interfaces", 'w') as f:
-                    new_content = "\n".join(contents)
-                    f.write(new_content)
-                return True
+                main_path = "/etc/network/interfaces"
+                if os.path.exists(main_path):
+                    with open(main_path, 'r') as f:
+                        existing = f.read().splitlines()
+                else:
+                    existing = []
+
+                new_block = [line.rstrip("\n") for line in contents]
+                start = None
+                end = None
+                in_block = False
+                for idx, line in enumerate(existing):
+                    if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                        if start is None:
+                            start = idx
+                            in_block = True
+                    elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                        end = idx
+                        in_block = False
+                        break
+                if start is not None and end is None:
+                    end = len(existing)
+                if start is None:
+                    updated = existing + ([""] if existing and existing[-1].strip() else []) + new_block
+                else:
+                    updated = existing[:start] + new_block + existing[end:]
+
+                return self._write_interfaces_file_with_backup(updated)
         except Exception as e:
             print('Failed to update interface configuration')
             print(e)
@@ -3865,10 +3896,19 @@ class AellaCli(cmd.Cmd, object):
                 return f.readlines()
         return []
 
+    def _netmask_to_cidr(self, netmask):
+        try:
+            packed = socket.inet_aton(netmask)
+            bits = bin(struct.unpack("!I", packed)[0]).count("1")
+            return bits
+        except Exception:
+            return None
+
     def _get_interface_expected_config(self, interface):
         lines = self._read_interface_config_lines(interface)
         in_block = False
         address = None
+        netmask = None
         dns_list = []
         for line in lines:
             if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
@@ -3880,10 +3920,146 @@ class AellaCli(cmd.Cmd, object):
             addr_match = re.match(r'^\s*address\s+(\S+)', line)
             if addr_match:
                 address = addr_match.group(1)
+            netmask_match = re.match(r'^\s*netmask\s+(\S+)', line)
+            if netmask_match:
+                netmask = netmask_match.group(1)
             dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
             if dns_match:
                 dns_list = [d for d in dns_match.group(1).strip().split() if self.valid_ipv4_address(d)]
-        return address, dns_list
+        expected_ip = None
+        if address:
+            if netmask:
+                cidr = self._netmask_to_cidr(netmask)
+                if cidr is not None:
+                    expected_ip = "{}/{}".format(address, cidr)
+            if expected_ip is None:
+                expected_ip = address
+        return expected_ip, dns_list
+
+    def _get_interface_netmask(self, interface):
+        lines = self._read_interface_config_lines(interface)
+        in_block = False
+        netmask = None
+        for line in lines:
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                in_block = True
+            elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                in_block = False
+            if not in_block:
+                continue
+            netmask_match = re.match(r'^\s*netmask\s+(\S+)', line)
+            if netmask_match:
+                netmask = netmask_match.group(1)
+        return netmask
+
+    def _ensure_interfaces_base(self):
+        main_path = "/etc/network/interfaces"
+        contents = []
+        if os.path.exists(main_path):
+            with open(main_path, 'r') as f:
+                contents = f.read().splitlines()
+        has_lo = any(re.match(r'^\s*iface\s+lo\s+inet\s+loopback', line) for line in contents)
+        has_auto_lo = any(re.match(r'^\s*auto\s+lo\b', line) for line in contents)
+        has_source = any(re.match(r'^\s*source\s+/etc/network/interfaces\.d/\*', line) for line in contents)
+        changed = False
+
+        if not has_auto_lo:
+            contents.insert(0, "auto lo")
+            changed = True
+        if not has_lo:
+            insert_at = 1 if contents and contents[0].strip() == "auto lo" else 0
+            contents.insert(insert_at, "iface lo inet loopback")
+            changed = True
+
+        if os.path.isdir("/etc/network/interfaces.d") and not has_source:
+            contents.append("source /etc/network/interfaces.d/*")
+            changed = True
+
+        if changed:
+            self._write_interfaces_file_with_backup(contents)
+
+    def _parse_iface_block(self, interface):
+        lines = self._read_interface_config_lines(interface)
+        in_block = False
+        mode = None
+        address = None
+        netmask = None
+        dns_list = []
+        block_lines = []
+        for line in lines:
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                in_block = True
+            elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                break
+            if not in_block:
+                continue
+            block_lines.append(line.rstrip("\n"))
+            iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(interface)), line)
+            if iface_match:
+                mode = iface_match.group(1)
+            addr_match = re.match(r'^\s*address\s+(\S+)', line)
+            if addr_match:
+                address = addr_match.group(1)
+            netmask_match = re.match(r'^\s*netmask\s+(\S+)', line)
+            if netmask_match:
+                netmask = netmask_match.group(1)
+            dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
+            if dns_match:
+                dns_list = [d for d in dns_match.group(1).strip().split() if self.valid_ipv4_address(d)]
+        return mode, address, netmask, dns_list, block_lines
+
+    def _write_interfaces_file_with_backup(self, contents):
+        main_path = "/etc/network/interfaces"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = "{}.bak.{}".format(main_path, timestamp)
+        try:
+            if os.path.exists(main_path):
+                with open(main_path, 'r') as f:
+                    existing = f.read()
+                with open(backup_path, 'w') as f:
+                    f.write(existing)
+            with open(main_path, 'w') as f:
+                f.write("\n".join(contents) + "\n")
+            return True
+        except Exception as e:
+            print('Failed to update interface configuration')
+            print(e)
+            return False
+
+    def _ensure_iface_stanza(self, interface, expected_ip, expected_dns):
+        mode, address, netmask, dns_list, block_lines = self._parse_iface_block(interface)
+        if mode:
+            if mode == "static" and (not address or not netmask):
+                print("Invalid interface stanza for {}: static requires address/netmask".format(interface))
+                for line in block_lines:
+                    print(line)
+                return False
+            return True
+
+        if not expected_ip:
+            print("Missing interface stanza for {} and no expected IP available".format(interface))
+            return False
+
+        addr, netmask_str = self.cidr_to_netmask(expected_ip) if "/" in expected_ip else (expected_ip, None)
+        if not addr or not netmask_str:
+            print("Failed to build static stanza for {} from expected IP".format(interface))
+            return False
+
+        new_block = [
+            "auto {}".format(interface),
+            "iface {} inet static".format(interface),
+            "address {}".format(addr),
+            "netmask {}".format(netmask_str),
+        ]
+        if expected_dns:
+            new_block.append("dns-nameservers {}".format(" ".join(expected_dns)))
+
+        lines = self._read_interface_config_lines(interface)
+        new_lines = [l.rstrip("\n") for l in lines]
+        if new_lines and new_lines[-1].strip():
+            new_lines.append("")
+        new_lines.extend(new_block)
+        return self._write_interfaces_file_with_backup(new_lines)
 
     def _apply_interface_config(self, interface, ip=None, gateway=None, dns_list=None):
         lines = self._read_interface_config_lines(interface)
@@ -4299,6 +4475,26 @@ class AellaCli(cmd.Cmd, object):
 
     def _restart_interface_with_verification(self, interface):
         expected_ip, expected_dns = self._get_interface_expected_config(interface)
+        self._ensure_interfaces_base()
+        if not self._ensure_iface_stanza(interface, expected_ip, expected_dns):
+            return False
+
+        dry_run = subprocess.run(
+            "ifup --no-act {}".format(interface),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if dry_run.returncode != 0:
+            print("ifup dry-run failed for {}".format(interface))
+            print("returncode: {}".format(dry_run.returncode))
+            if dry_run.stdout:
+                print("stdout: {}".format(dry_run.stdout.strip()))
+            if dry_run.stderr:
+                print("stderr: {}".format(dry_run.stderr.strip()))
+            return False
+
         if not self.restart_new_network_manager(interface, expected_ip=expected_ip, expected_dns=expected_dns):
             return False
         print("Restart completed.\n")
@@ -4326,23 +4522,26 @@ class AellaCli(cmd.Cmd, object):
                 print("Failed to restart networking! {}".format(err_msg))
                 return False
             down_proc = subprocess.run(
-                "ifdown {0} 2>/dev/null".format(interface),
+                "ifdown {0}".format(interface),
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             up_proc = subprocess.run(
-                "ifup {0} 2>/dev/null".format(interface),
+                "ifup {0}".format(interface),
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             if up_proc.returncode != 0:
-                err_msg = up_proc.stderr.strip() if up_proc.stderr else up_proc.stdout.strip()
-                err_msg = err_msg if err_msg else "Unknown error"
-                print("Failed to restart networking! {}".format(err_msg))
+                print("Failed to restart networking!")
+                print("returncode: {}".format(up_proc.returncode))
+                if up_proc.stdout:
+                    print("stdout: {}".format(up_proc.stdout.strip()))
+                if up_proc.stderr:
+                    print("stderr: {}".format(up_proc.stderr.strip()))
                 return False
         except Exception as e:
             print("Failed to restart networking! {}".format(e))
@@ -4358,6 +4557,30 @@ class AellaCli(cmd.Cmd, object):
         inet_lines = []
         if addr_out.returncode == 0 and addr_out.stdout:
             inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout)
+        if len(inet_lines) == 0 and expected_ip:
+            add_proc = subprocess.run(
+                "ip -4 addr add {} dev {}".format(expected_ip, interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if add_proc.returncode != 0:
+                err_msg = add_proc.stderr.strip() if add_proc.stderr else add_proc.stdout.strip()
+                err_msg = err_msg if err_msg else "Unknown error"
+                print("Failed to recover IP address on {}: {}".format(interface, err_msg))
+                return False
+            addr_out = subprocess.run(
+                "ip -4 addr show dev {}".format(interface),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout or "")
+            if len(inet_lines) != 1 or expected_ip not in inet_lines:
+                print("Failed to verify IPv4 address count on {} after recovery".format(interface))
+                return False
         if len(inet_lines) > 1:
             if not expected_ip:
                 print("Multiple IPv4 addresses detected on {} after restart".format(interface))
@@ -4550,6 +4773,13 @@ class AellaCli(cmd.Cmd, object):
                 if parsed["ip"] == 'dhcp':
                     print("Invalid ip option: DHCP client is not supported")
                     return
+                if '/' not in parsed["ip"] and self.valid_ipv4_address(parsed["ip"]):
+                    current_netmask = self._get_interface_netmask(interface)
+                    if current_netmask:
+                        parsed["ip"] = "{}/{}".format(parsed["ip"], current_netmask)
+                    else:
+                        print('Please specify network mask: {0}'.format(parsed["ip"]))
+                        return
                 if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
                     print('Invalid IP address format: {0}'.format(parsed["ip"]))
                     return
@@ -4587,6 +4817,14 @@ class AellaCli(cmd.Cmd, object):
             return
         if option == 'ip':
             #if ip_address != 'dhcp' and len(ip_address.split('.')) < 4:
+            if ip_address != 'dhcp' and '/' not in ip_address and self.valid_ipv4_address(ip_address):
+                current_netmask = self._get_interface_netmask(interface)
+                if current_netmask:
+                    ip_address = "{}/{}".format(ip_address, current_netmask)
+                    param[2] = ip_address
+                else:
+                    print('Please specify network mask: {0}'.format(ip_address))
+                    return
             if ip_address != 'dhcp' and not self.valid_ipv4_address(ip_address):
                 print('Invalid IP address format: {0}'.format(ip_address))
                 return
