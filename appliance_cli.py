@@ -36,6 +36,8 @@ import struct
 import hashlib
 import logging
 import logging.handlers
+import ipaddress
+import shlex
 
 # Timezone constants
 try:
@@ -47,10 +49,18 @@ except Exception:
 # Logging utilities
 LOG_DIR = "/var/log/aella"
 ACL_STAGING_PATH = "/var/lib/aella/acl_staging.json"
+ACL_STATE_PATH = "/var/lib/aella/acl_state.json"
 ACL_COMMENT_PREFIX = "AELLA_ACL "
 ACL_AUTO_COMMENT = "AELLA_ACL_AUTO Current SSH session"
 LOCAL_ALWAYS_ALLOW_COMMENT = "AELLA_LOCAL_ALWAYS_ALLOW"
-ALWAYS_ALLOW_DEST_IPS = ["127.0.0.1", "192.168.0.100"]
+ALWAYS_ALLOW_DEST_IPS = ["127.0.0.1", "192.168.0.100", "192.168.122.1"]
+AELLA_INPUT_CHAIN = "AELLA_INPUT"
+AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT = "AELLA_SYSTEM Allow established"
+AELLA_SYSTEM_JUMP_COMMENT = "AELLA_SYSTEM Jump to AELLA_INPUT"
+AELLA_DEFAULT_WHITELIST_COMMENT = "AELLA_DEFAULT Whitelist deny all"
+AELLA_DEFAULT_BLACKLIST_COMMENT = "AELLA_DEFAULT Blacklist allow all"
+ACL_EXCLUDE_IPS = ("192.168.0.100", "192.168.122.1")
+ACL_EXCLUDE_IP = ACL_EXCLUDE_IPS[0]
 
 
 def get_username():
@@ -697,6 +707,8 @@ class AellaCli(cmd.Cmd, object):
     def complete_show(self, text, line, begidx, endidx):
         if not text:
             completions = self.show_command_help.keys()
+        elif line.startswith('show interface'):
+            return self.complete_show_interface(text, line, begidx, endidx)
         else:
             completions = [f for f in self.show_command_help.keys() if f.startswith(text)]
         return completions
@@ -1311,69 +1323,62 @@ class AellaCli(cmd.Cmd, object):
         return status, output
 
     def show_acl_callback(self, key, param):
-        """Show current iptables ACL rules with descriptions"""
+        """
+        NEW:
+          show acl
+
+        Shows:
+          - policy summary (mode/iface/iface_ip)
+          - AELLA_INPUT_CHAIN rules in real order (only AELLA_ACL + default tail)
+        """
+        state = self._load_acl_state()
+        if not state:
+            output = "\nACL policy is not initialized. Run 'set acl policy' first.\n"
+            print(output)
+            return 1, output
+
+        iface = state["iface"]
         try:
-            output = "\n"
-            output += "=" * 60 + "\n"
-            output += "Access Control List (AELLA_ACL rules)\n"
-            output += "=" * 60 + "\n"
+            iface_ip = self._get_iface_ipv4(iface)
+        except Exception:
+            iface_ip = "(unknown)"
 
-            mgt_ip = self._get_mgt_ipv4()
-            dest_cidr = "{}/32".format(mgt_ip)
+        output = "\n" + "=" * 60 + "\n"
+        output += "Access Control List (AELLA managed)\n"
+        output += "=" * 60 + "\n"
+        output += f"mode : {state['mode']}\n"
+        output += f"iface: {iface}\n"
+        output += f"iface_ip: {iface_ip}\n\n"
 
-            cmd = "sudo iptables -S INPUT"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-
-            if proc.returncode != 0:
-                error_msg = err.decode('utf-8', errors='ignore') if err else "Unknown error"
-                output += "Failed to get iptables rules: {}\n".format(error_msg)
-                output += "\n"
-                print(output)
-                return 1, None
-
-            lines = out.decode('utf-8', errors='ignore').split('\n') if out else []
-            acl_entries = []
-            for line in lines:
-                if not line.startswith("-A INPUT"):
-                    continue
-                if ACL_COMMENT_PREFIX.strip() not in line:
-                    continue
-                if "-d {}".format(dest_cidr) not in line:
-                    continue
-
-                target_match = re.search(r"-j\s+(ACCEPT|DROP)", line)
-                action = "allow" if target_match and target_match.group(1) == "ACCEPT" else "deny"
-
-                source_match = re.search(r"-s\s+(\S+)", line)
-                source = source_match.group(1) if source_match else "0.0.0.0/0"
-
-                port_match = re.search(r"--dport\s+(\d+)", line)
-                port = port_match.group(1) if port_match else "all"
-
-                comment_match = re.search(r'--comment\s+"([^"]+)"', line)
-                desc = ""
-                if comment_match:
-                    raw_comment = comment_match.group(1)
-                    desc = raw_comment.replace(ACL_COMMENT_PREFIX, "", 1).strip()
-
-                acl_entries.append((action, source, port, desc))
-
-            if acl_entries:
-                for action, source, port, desc in acl_entries:
-                    if desc:
-                        output += "  {} {} {} ({})\n".format(action, source, port, desc)
-                    else:
-                        output += "  {} {} {}\n".format(action, source, port)
-            else:
-                output += "  No AELLA_ACL rules found\n"
-
-            output += "\n"
+        if not self._iptables_chain_exists(AELLA_INPUT_CHAIN):
+            output += "No applied ACL chain found. (No rules applied yet)\n\n"
             print(output)
             return 0, output
-        except Exception as e:
-            print("Failed to show ACL rules: {}\n".format(e))
-            return 1, None
+
+        rc, out, err = self._run_cmd(f"sudo iptables -S {AELLA_INPUT_CHAIN}")
+        if rc != 0:
+            output += "Failed to get iptables rules: {}\n\n".format(err.strip() or "Unknown error")
+            print(output)
+            return 1, output
+
+        lines = out.splitlines() if out else []
+        shown = 0
+        for line in lines:
+            if not line.startswith(f"-A {AELLA_INPUT_CHAIN}"):
+                continue
+            if ACL_COMMENT_PREFIX.strip() in line:
+                shown += 1
+                output += f"  {line}\n"
+                continue
+            if AELLA_DEFAULT_WHITELIST_COMMENT in line or AELLA_DEFAULT_BLACKLIST_COMMENT in line:
+                shown += 1
+                output += f"  {line}\n"
+
+        if shown == 0:
+            output += "  (No AELLA ACL rules found in chain)\n"
+        output += "\n"
+        print(output)
+        return 0, output
 
     def is_sensor_host_mode(self):
         """Detect whether this host is a Sensor KVM host (mds/mds2, br-data, etc.)."""
@@ -1490,14 +1495,14 @@ class AellaCli(cmd.Cmd, object):
             except ValueError as e:
                 print('{}\n'.format(e))
                 return
+            if parsed["dns"] and not parsed["ip"]:
+                print('DNS must be set together with IP address on host interface\n')
+                print('Example: set interface {0} ip <IP/Mask> dns <DNS1> [DNS2 ...]\n'.format(interface))
+                return
             if parsed["ip"]:
                 if '/' not in parsed["ip"] and self.valid_ipv4_address(parsed["ip"]):
-                    current_netmask = self._get_interface_netmask(interface)
-                    if current_netmask:
-                        parsed["ip"] = "{}/{}".format(parsed["ip"], current_netmask)
-                    else:
-                        print('Please specify network mask: {0}\n'.format(parsed["ip"]))
-                        return
+                    print('Please specify network mask: {0}\n'.format(parsed["ip"]))
+                    return
                 if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
                     print('\n<IP Address/Netmask>   Specify interface IP address and netmask\n')
                     return
@@ -1544,9 +1549,9 @@ class AellaCli(cmd.Cmd, object):
                 print('\n<IP Address>      Specify default gateway IP address\n')
                 return
         if option == 'dns':
-            if len(param) < 3:
-                print('\n<IP Address> [...]    Specify DNS server IP address(es) separated by space\n')
-                return
+            print('DNS must be set together with IP address on host interface\n')
+            print('Example: set interface {0} ip <IP/Mask> dns <DNS1> [DNS2 ...]\n'.format(interface))
+            return
             for d in param[2:]:
                 if not self.valid_ipv4_address(d):
                     print('Invalid DNS server IP address format: {0}\n'.format(d))
@@ -2151,20 +2156,762 @@ class AellaCli(cmd.Cmd, object):
 
     def _get_local_interface_ips(self):
         """Return only the approved always-allow destination IPs"""
-        return ["127.0.0.1", "192.168.0.100"]
+        return list(ALWAYS_ALLOW_DEST_IPS)
+
+    def get_ipv4_addrs(self, iface: str) -> list[str]:
+        """Return IPv4 addresses for an interface"""
+        cmd = ["ip", "-4", "-o", "addr", "show", "dev", iface]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+        addrs = []
+        for line in proc.stdout.splitlines():
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", line)
+            if match:
+                addrs.append(match.group(1))
+        return addrs
+
+    def list_candidate_ifaces(self, exclude_ips: Sequence[str] = ACL_EXCLUDE_IPS) -> list[dict]:
+        """Return candidate interfaces with IPv4 list, excluding any in ACL_EXCLUDE_IPS"""
+        if isinstance(exclude_ips, str):
+            exclude_set = {exclude_ips}
+        else:
+            exclude_set = set(exclude_ips)
+        candidates = []
+        for iface in self.list_host_nics():
+            ipv4s = self.get_ipv4_addrs(iface)
+            if not ipv4s:
+                continue
+            if exclude_set.intersection(ipv4s):
+                continue
+            candidates.append({"iface": iface, "ipv4": ipv4s})
+        return candidates
+
+    def _load_acl_state(self) -> dict:
+        """Load ACL policy state"""
+        default_data = {"mode": None, "iface": None, "exclude_ip": list(ACL_EXCLUDE_IPS)}
+        try:
+            with open(ACL_STATE_PATH, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return default_data
+        except PermissionError:
+            proc = subprocess.run(
+                ["sudo", "cat", ACL_STATE_PATH],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                return default_data
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return default_data
+        except json.JSONDecodeError:
+            return default_data
+        except Exception:
+            return default_data
+
+        if not isinstance(data, dict):
+            return default_data
+        if "mode" not in data or "iface" not in data:
+            return default_data
+        if "exclude_ip" not in data:
+            data["exclude_ip"] = list(ACL_EXCLUDE_IPS)
+        return data
+
+    def load_acl_state(self) -> dict:
+        return self._load_acl_state()
+
+    def _save_acl_state(self, data: dict) -> None:
+        """Save ACL policy state"""
+        target_dir = os.path.dirname(ACL_STATE_PATH)
+        make_dir(target_dir, root=True)
+        payload = json.dumps(data, indent=2, sort_keys=False)
+        tmp_path = "/tmp/acl_state.json"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(payload)
+            subprocess.run(
+                ["sudo", "mv", tmp_path, ACL_STATE_PATH],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            try:
+                subprocess.run(
+                    ["sudo", "tee", ACL_STATE_PATH],
+                    input=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+    def save_acl_state(self, data: dict) -> None:
+        self._save_acl_state(data)
+
+    def _run_whiptail_radiolist(self, title: str, text: str, items: list[tuple[str, str, bool]]) -> Optional[str]:
+        args = ["whiptail", "--title", title, "--radiolist", text, "20", "78", str(len(items))]
+        for tag, desc, on in items:
+            args.extend([tag, desc, "ON" if on else "OFF"])
+        try:
+            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except FileNotFoundError:
+            return self._prompt_radiolist(title, text, items)
+        if proc.returncode != 0:
+            return None
+        if not proc.stdout:
+            return self._prompt_radiolist(title, text, items)
+        return proc.stdout.strip()
+
+    def _run_whiptail_yesno(self, title: str, text: str) -> bool:
+        args = ["whiptail", "--title", title, "--yesno", text, "20", "78"]
+        try:
+            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except FileNotFoundError:
+            return self._prompt_yesno(title, text)
+        return proc.returncode == 0
+
+    def _prompt_yesno(self, title: str, text: str) -> bool:
+        print("\n{}:".format(title))
+        print(text)
+        while True:
+            choice = input("Type 'yes' to continue or 'no' to cancel: ").strip().lower()
+            if choice in ("yes", "y"):
+                return True
+            if choice in ("no", "n"):
+                return False
+            print("Please enter yes or no.")
+
+    def _prompt_radiolist(self, title: str, text: str, items: list[tuple[str, str, bool]]) -> Optional[str]:
+        print("\n{}:".format(title))
+        print(text)
+        for idx, (tag, desc, _on) in enumerate(items, start=1):
+            print("  {}) {} - {}".format(idx, tag, desc))
+        while True:
+            choice = input("Select number (or press Enter to cancel): ").strip()
+            if choice == "":
+                return None
+            if not choice.isdigit():
+                print("Please enter a valid number.")
+                continue
+            index = int(choice)
+            if 1 <= index <= len(items):
+                return items[index - 1][0]
+            print("Please enter a valid number.")
+
+    def _is_iface_candidate(self, iface: str, exclude_ips: Sequence[str]) -> bool:
+        candidates = self.list_candidate_ifaces(exclude_ips=exclude_ips)
+        return any(item["iface"] == iface for item in candidates)
+
+    def _print_acl_help(self, policy_configured: bool) -> None:
+        print("ACL policy is not initialized.")
+        print("You must run 'set acl policy' before adding or applying any ACL rules.\n")
+        print('------------------------------------------------------------')
+        print('Required first step:')
+        print('  set acl policy        Initialize ACL mode (whitelist/blacklist) and target interface\n')
+        print('------------------------------------------------------------')
+        print('ACL rule syntax (available after policy is initialized):')
+        print('  set acl <IP/network> <port|icmp|ping|all> [description]\n')
+        print('  IP/network : IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
+        print('  port       : Port number (e.g., 22, 80, 443), "icmp"/"ping", or "all" for all ports')
+        print('               Multiple ports can be specified separated by space')
+        print('  description: Optional description/comment\n')
+        print('------------------------------------------------------------')
+        print('Apply staged rules (rules must exist):')
+        print('  set acl apply          Apply staged ACL rules (merge)')
+        print('  set acl apply --reset  Reset applied ACL rules and rebuild from staging\n')
+        print('------------------------------------------------------------')
+        print('Examples:')
+        print('  set acl policy')
+        print('  set acl 192.168.1.100 22 "Admin SSH access"')
+        print('  set acl 192.168.1.0/24 80 443 "Web servers"')
+        print('  set acl 10.0.0.0/8 all "Internal network"')
+        print('  set acl apply\n')
+
+    def _print_acl_policy_warning_only(self) -> None:
+        print("ACL policy is not configured. Run: set acl policy\n")
+
+    def _delete_acl_state_file(self) -> None:
+        try:
+            subprocess.run(["sudo", "rm", "-f", ACL_STATE_PATH], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except Exception:
+            pass
+
+    def _clear_aella_managed_rules(self) -> None:
+        lines = self._read_chain_rule_lines("INPUT")
+        for line in lines:
+            if AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line or "-j {}".format(AELLA_INPUT_CHAIN) in line:
+                self._delete_chain_rule_line(line)
+
+        if subprocess.run(["sudo", "iptables", "-S", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).returncode == 0:
+            _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+            for rule in chain_rules:
+                if "AELLA_DEFAULT" in (rule.get("comment") or "") or self._comment_is_user_acl(rule.get("comment")):
+                    self._delete_chain_rule_line(rule["raw"])
+            subprocess.run(["sudo", "iptables", "-F", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            subprocess.run(["sudo", "iptables", "-X", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+
+    def _run_policy_wizard(self) -> Optional[dict]:
+        exclude_ips = ACL_EXCLUDE_IPS
+        candidates = self.list_candidate_ifaces(exclude_ips=exclude_ips)
+        if not candidates:
+            print("ACL 적용 가능한 IPv4 인터페이스가 없습니다.\n")
+            return None
+
+        mode_text = (
+            "Select ACL mode.\n\n"
+            "Whitelist: only the rules you enter are allowed, everything else is dropped (DROP). "
+            "You must allow your SSH management IP.\n"
+            "Blacklist: only the rules you enter are dropped (DROP), everything else is allowed (ACCEPT)."
+        )
+        mode = self._run_whiptail_radiolist(
+            "ACL Mode",
+            mode_text,
+            [
+                ("whitelist", "Allow only listed rules (default deny)", True),
+                ("blacklist", "Deny only listed rules (default allow)", False),
+            ],
+        )
+        if not mode:
+            return None
+
+        iface_items = []
+        for i, item in enumerate(candidates):
+            iface = item["iface"]
+            ips = ", ".join(item["ipv4"])
+            iface_items.append((iface, "IPv4: {}".format(ips), i == 0))
+        iface = self._run_whiptail_radiolist("ACL Interface", "Select a single interface for ACL.", iface_items)
+        if not iface:
+            return None
+
+        return {"mode": mode, "iface": iface, "exclude_ip": list(exclude_ips)}
+
+    def configure_acl_policy(self) -> bool:
+        warning_text = (
+            "WARNING: Re-initializing ACL policy will DELETE ALL existing ACL rules (staged and applied).\n"
+            "This action cannot be undone. Continue?"
+        )
+        if not self._run_whiptail_yesno("ACL Policy", warning_text):
+            return False
+
+        self._delete_acl_state_file()
+        self._clear_acl_staging()
+        self._clear_aella_managed_rules()
+
+        state = self._run_policy_wizard()
+        if not state:
+            return False
+
+        self._save_acl_state(state)
+        print("Policy is configured. No firewall rules are active until at least one ACL rule is added and 'set acl apply' is executed.\n")
+        return True
+
+    def get_current_ssh_client_ip(self) -> Optional[str]:
+        """Get current SSH client IPv4 address if available"""
+        env_val = os.environ.get("SSH_CONNECTION")
+        if env_val:
+            tokens = env_val.strip().split()
+            candidate = tokens[0] if tokens else None
+            if candidate and self.valid_ipv4_address(candidate):
+                return candidate
+        env_val = os.environ.get("SSH_CLIENT")
+        if env_val:
+            tokens = env_val.strip().split()
+            candidate = tokens[0] if tokens else None
+            if candidate and self.valid_ipv4_address(candidate):
+                return candidate
+        return None
+
+    def _run_iptables(self, args: list[str], error_prefix: str) -> str:
+        proc = subprocess.run(["sudo", "iptables"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
+            raise RuntimeError("{}: {}".format(error_prefix, err_msg))
+        return proc.stdout or ""
+
+    def _read_chain_rule_lines(self, chain: str) -> list[str]:
+        proc = subprocess.run(["sudo", "iptables", "-S", chain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode != 0:
+            return []
+        return [line for line in proc.stdout.splitlines() if line.startswith("-A ")]
+
+    def _delete_chain_rule_line(self, line: str) -> None:
+        tokens = shlex.split(line)
+        if not tokens or tokens[0] != "-A":
+            return
+        tokens[0] = "-D"
+        self._run_iptables(tokens, "Failed to delete iptables rule")
+
+    def parse_chain_rules(self, chain: str) -> tuple[list[str], list[dict]]:
+        lines = self._read_chain_rule_lines(chain)
+        rules = []
+        for line in lines:
+            tokens = shlex.split(line)
+            rule = {
+                "raw": line,
+                "src": None,
+                "proto": None,
+                "dport": None,
+                "target": None,
+                "comment": None,
+            }
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok == "-s" and i + 1 < len(tokens):
+                    rule["src"] = tokens[i + 1]
+                    i += 2
+                    continue
+                if tok == "-p" and i + 1 < len(tokens):
+                    rule["proto"] = tokens[i + 1]
+                    i += 2
+                    continue
+                if tok == "--dport" and i + 1 < len(tokens):
+                    rule["dport"] = tokens[i + 1]
+                    i += 2
+                    continue
+                if tok == "-j" and i + 1 < len(tokens):
+                    rule["target"] = tokens[i + 1]
+                    i += 2
+                    continue
+                if tok == "--comment" and i + 1 < len(tokens):
+                    rule["comment"] = tokens[i + 1]
+                    i += 2
+                    continue
+                i += 1
+            rules.append(rule)
+        return lines, rules
+
+    def ensure_aella_chain(self) -> None:
+        proc = subprocess.run(["sudo", "iptables", "-S", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if proc.returncode == 0:
+            return
+        self._run_iptables(["-N", AELLA_INPUT_CHAIN], "Failed to create AELLA_INPUT chain")
+
+    def ensure_established_rule(self) -> None:
+        lines = self._read_chain_rule_lines("INPUT")
+        for line in lines:
+            if AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line:
+                self._delete_chain_rule_line(line)
+        self._run_iptables(
+            [
+                "-I",
+                "INPUT",
+                "1",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+                "-m",
+                "comment",
+                "--comment",
+                AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT,
+            ],
+            "Failed to ensure established/related rule",
+        )
+
+    def ensure_jump_rule(self, iface: str) -> None:
+        lines = self._read_chain_rule_lines("INPUT")
+        for line in lines:
+            if "-j {}".format(AELLA_INPUT_CHAIN) in line:
+                self._delete_chain_rule_line(line)
+        self._run_iptables(
+            [
+                "-I",
+                "INPUT",
+                "2",
+                "-i",
+                iface,
+                "-j",
+                AELLA_INPUT_CHAIN,
+                "-m",
+                "comment",
+                "--comment",
+                AELLA_SYSTEM_JUMP_COMMENT,
+            ],
+            "Failed to ensure AELLA jump rule",
+        )
+
+    def ensure_default_tail_rule_last(self, mode: str) -> None:
+        lines = self._read_chain_rule_lines(AELLA_INPUT_CHAIN)
+        for line in lines:
+            if "AELLA_DEFAULT" in line:
+                self._delete_chain_rule_line(line)
+        if mode == "whitelist":
+            self._run_iptables(
+                [
+                    "-A",
+                    AELLA_INPUT_CHAIN,
+                    "-j",
+                    "DROP",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    AELLA_DEFAULT_WHITELIST_COMMENT,
+                ],
+                "Failed to ensure default whitelist tail rule",
+            )
+        else:
+            self._run_iptables(
+                [
+                    "-A",
+                    AELLA_INPUT_CHAIN,
+                    "-j",
+                    "ACCEPT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    AELLA_DEFAULT_BLACKLIST_COMMENT,
+                ],
+                "Failed to ensure default blacklist tail rule",
+            )
+
+    def build_user_rule_args(self, src: str, port: str, mode: str, desc: str) -> list[str]:
+        target = "ACCEPT" if mode == "whitelist" else "DROP"
+        args = ["-A", AELLA_INPUT_CHAIN]
+        any_source = src in ("0.0.0.0/0", "0.0.0.0")
+        if not any_source:
+            args.extend(["-s", src])
+        if port != "all":
+            args.extend(["-p", "tcp", "--dport", str(port)])
+        comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
+        args.extend(["-m", "comment", "--comment", comment_value, "-j", target])
+        return args
+
+    def _rule_signature(self, src: Optional[str], proto: Optional[str], dport: Optional[str], target: Optional[str]) -> tuple:
+        src_key = src if src else "0.0.0.0/0"
+        dport_key = dport if dport else "all"
+        if dport_key != "all":
+            proto_key = proto if proto else "tcp"
+        else:
+            proto_key = proto if proto else "all"
+        return (src_key, proto_key, dport_key, target or "")
+
+    def _comment_is_user_acl(self, comment: Optional[str]) -> bool:
+        if not comment:
+            return False
+        if "AELLA_ACL_AUTO" in comment:
+            return False
+        return comment.startswith(ACL_COMMENT_PREFIX.strip())
+
+    def _comment_is_default_tail(self, comment: Optional[str]) -> bool:
+        return bool(comment and comment.startswith("AELLA_DEFAULT"))
+
+    def apply_merge(self, staging_rules: list[dict], state: dict) -> None:
+        if not staging_rules:
+            print("No staged ACL rules. Nothing to apply.\n")
+            return
+        self.ensure_aella_chain()
+        self.ensure_established_rule()
+        self.ensure_jump_rule(state["iface"])
+
+        _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+        existing_keys = set()
+        for rule in chain_rules:
+            if not self._comment_is_user_acl(rule.get("comment")):
+                continue
+            existing_keys.add(self._rule_signature(rule.get("src"), rule.get("proto"), rule.get("dport"), rule.get("target")))
+
+        for rule in chain_rules:
+            if self._comment_is_default_tail(rule.get("comment")):
+                self._delete_chain_rule_line(rule["raw"])
+
+        for rule in staging_rules:
+            source = rule.get("source")
+            ports = rule.get("ports", [])
+            desc = rule.get("desc", "")
+            for port in ports:
+                args = self.build_user_rule_args(source, port, state["mode"], desc)
+                key = self._rule_signature(
+                    None if source in ("0.0.0.0/0", "0.0.0.0") else source,
+                    "tcp" if port != "all" else None,
+                    None if port == "all" else str(port),
+                    "ACCEPT" if state["mode"] == "whitelist" else "DROP",
+                )
+                if key in existing_keys:
+                    continue
+                self._run_iptables(args, "Failed to apply ACL rule")
+                existing_keys.add(key)
+
+        self.ensure_default_tail_rule_last(state["mode"])
+        self._clear_acl_staging()
+
+    def apply_reset(self, staging_rules: list[dict], state: dict) -> None:
+        if not staging_rules:
+            print("No staged ACL rules. Nothing to apply.\n")
+            return
+        self.ensure_aella_chain()
+        self.ensure_established_rule()
+        self.ensure_jump_rule(state["iface"])
+
+        lines, parsed = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+        for rule in parsed:
+            if self._comment_is_user_acl(rule.get("comment")) or self._comment_is_default_tail(rule.get("comment")):
+                self._delete_chain_rule_line(rule["raw"])
+
+        for rule in staging_rules:
+            source = rule.get("source")
+            ports = rule.get("ports", [])
+            desc = rule.get("desc", "")
+            for port in ports:
+                args = self.build_user_rule_args(source, port, state["mode"], desc)
+                self._run_iptables(args, "Failed to apply ACL rule")
+
+        self.ensure_default_tail_rule_last(state["mode"])
+        self._clear_acl_staging()
+
+    def unset_acl(self, src: str, ports: list[str], state: Optional[dict]) -> tuple[int, int]:
+        live_removed = 0
+        staged_removed = 0
+
+        if ports != ["all"]:
+            normalized_ports = []
+            for p in ports:
+                p = "icmp" if p == "ping" else p
+                if p not in normalized_ports:
+                    normalized_ports.append(p)
+            ports = normalized_ports
+
+        any_source = src in ("0.0.0.0/0", "0.0.0.0")
+        _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+        for rule in chain_rules:
+            if not self._comment_is_user_acl(rule.get("comment")):
+                continue
+            rule_src = rule.get("src")
+            if any_source:
+                if rule_src and rule_src != "0.0.0.0/0":
+                    continue
+            else:
+                if rule_src != src:
+                    continue
+            if rule.get("proto") == "icmp":
+                rule_port = "icmp"
+            else:
+                rule_port = rule.get("dport") if rule.get("dport") else "all"
+            if "all" in ports:
+                if rule_port != "all":
+                    continue
+            else:
+                if rule_port not in [str(p) for p in ports]:
+                    continue
+            self._delete_chain_rule_line(rule["raw"])
+            live_removed += 1
+
+        staging = self._load_acl_staging()
+        rules = staging.get("rules", [])
+        new_rules = []
+        for rule in rules:
+            rule_source = rule.get("source")
+            rule_ports = [str(p) for p in rule.get("ports", [])]
+            if any_source:
+                if rule_source not in ("0.0.0.0/0", "0.0.0.0"):
+                    new_rules.append(rule)
+                    continue
+            else:
+                if rule_source != src:
+                    new_rules.append(rule)
+                    continue
+
+            if "all" in ports:
+                if "all" in rule_ports:
+                    staged_removed += 1
+                    continue
+                new_rules.append(rule)
+                continue
+
+            if "all" in rule_ports:
+                new_rules.append(rule)
+                continue
+
+            remaining_ports = [p for p in rule_ports if p not in [str(pv) for pv in ports]]
+            if remaining_ports != rule_ports:
+                staged_removed += 1
+            if remaining_ports:
+                rule["ports"] = remaining_ports
+                new_rules.append(rule)
+
+        if new_rules != rules:
+            staging["rules"] = new_rules
+            self._save_acl_staging(staging)
+        return live_removed, staged_removed
+
+    def show_acl(self) -> str:
+        output = "\n"
+        output += "=" * 60 + "\n"
+        output += "Access Control List (AELLA_ACL rules)\n"
+        output += "=" * 60 + "\n"
+
+        state = self._load_acl_state()
+        mode = state.get("mode") or "unset"
+        iface = state.get("iface") or "unset"
+        output += "Mode: {}\n".format(mode)
+        output += "Interface: {}\n".format(iface)
+        output += "-" * 60 + "\n"
+
+        input_lines = self._read_chain_rule_lines("INPUT")
+        established_present = any(AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line for line in input_lines)
+        jump_line = next((line for line in input_lines if AELLA_SYSTEM_JUMP_COMMENT in line), None)
+        jump_iface = None
+        if jump_line:
+            match = re.search(r"-i\s+(\S+)", jump_line)
+            if match:
+                jump_iface = match.group(1)
+
+        output += "System: established rule: {}\n".format("present" if established_present else "absent")
+        if jump_line:
+            output += "System: jump rule: present (iface {})\n".format(jump_iface or "unknown")
+        else:
+            output += "System: jump rule: absent\n"
+        output += "-" * 60 + "\n"
+
+        _, rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+        acl_entries = []
+        tail_entry = None
+        for rule in rules:
+            comment = rule.get("comment") or ""
+            if self._comment_is_user_acl(comment):
+                target = rule.get("target")
+                action = "allow" if target == "ACCEPT" else "deny"
+                source = rule.get("src") if rule.get("src") else "0.0.0.0/0"
+                port = rule.get("dport") if rule.get("dport") else "all"
+                desc = ""
+                if comment.startswith(ACL_COMMENT_PREFIX):
+                    desc = comment.replace(ACL_COMMENT_PREFIX, "", 1).strip()
+                acl_entries.append((action, source, port, desc))
+                continue
+            if comment.startswith("AELLA_DEFAULT"):
+                tail_entry = comment
+
+        if acl_entries:
+            for action, source, port, desc in acl_entries:
+                if desc:
+                    output += "  {} {} {} ({})\n".format(action, source, port, desc)
+                else:
+                    output += "  {} {} {}\n".format(action, source, port)
+        else:
+            output += "  No AELLA_ACL rules found\n"
+
+        if tail_entry:
+            output += "  [{}]\n".format(tail_entry)
+
+        output += "\n"
+        print(output)
+        return output
+
+    def compute_apply_risk(self, mode: str, client_ip: Optional[str], staging_rules: list[dict], live_rules: list[dict]) -> tuple[str, str]:
+        if not client_ip:
+            return ("WARN", "Unable to detect current SSH client IP. Applying may terminate your session and block future access.")
+
+        def _ip_in_sources(ip: str, sources: list[str]) -> bool:
+            ip_obj = ipaddress.ip_address(ip)
+            for src in sources:
+                try:
+                    if src in ("0.0.0.0/0", "0.0.0.0"):
+                        return True
+                    if "/" in src:
+                        if ip_obj in ipaddress.ip_network(src, strict=False):
+                            return True
+                    else:
+                        if ip_obj == ipaddress.ip_address(src):
+                            return True
+                except Exception:
+                    continue
+            return False
+
+        sources = []
+        for rule in staging_rules:
+            source = rule.get("source")
+            if source:
+                sources.append(source)
+
+        if mode == "whitelist":
+            if not _ip_in_sources(client_ip, sources):
+                return ("HIGH", "Your current SSH client IP is NOT in the allow list. Applying may terminate your session and block future access.")
+        if mode == "blacklist":
+            if _ip_in_sources(client_ip, sources):
+                return ("HIGH", "Your current SSH client IP IS in the deny list. Applying may terminate your session immediately.")
+
+        return ("OK", "No immediate SSH risk detected based on current rules.")
+
+    def confirm_apply_with_risk_summary(self, mode: str, iface: str, client_ip: Optional[str], risk_level: str, risk_message: str) -> bool:
+        client_ip_text = client_ip if client_ip else "Unable to detect current SSH client IP"
+        summary = (
+            "Review before applying ACL.\n\n"
+            "Mode: {}\n"
+            "Interface: {}\n"
+            "SSH Client IP: {}\n"
+            "Risk: {}\n\n"
+            "{}\n\n"
+            "Continue?"
+        ).format(mode, iface, client_ip_text, risk_level, risk_message)
+        return self._run_whiptail_yesno("ACL Apply Confirmation", summary)
 
     def _get_mgt_ipv4(self) -> str:
-        cmd = "ip -4 addr show dev mgt"
+        return self._get_acl_ipv4("mgt")
+
+    def _acl_iface_exists(self, interface: str) -> bool:
+        cmd = "ip link show {}".format(interface)
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            return False
+        if err:
+            err_text = err.decode("utf-8", errors="ignore")
+            if 'does not exist' in err_text:
+                return False
+        return True
+
+    def _default_acl_iface(self) -> str:
+        if self._acl_iface_exists("mgt"):
+            return "mgt"
+        if self._acl_iface_exists("host") or self._acl_iface_exists("hostmgmt"):
+            return "host"
+        return "mgt"
+
+    def _get_acl_ipv4(self, interface: str) -> str:
+        interface = interface.strip().lower()
+        if interface not in {"mgt", "host"}:
+            raise RuntimeError("Unsupported ACL interface: {}".format(interface))
+        cmd = "ip -4 addr show dev {}".format(interface)
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = proc.communicate()
         if proc.returncode != 0 or not out:
-            err_msg = err.decode("utf-8", errors="ignore").strip() if err else "mgt IPv4 not found"
-            raise RuntimeError("Failed to get mgt IPv4 address: {}".format(err_msg))
+            if interface == "host":
+                cmd_alt = "ip -4 addr show dev hostmgmt"
+                proc_alt = subprocess.Popen(cmd_alt, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_alt, err_alt = proc_alt.communicate()
+                if proc_alt.returncode == 0 and out_alt:
+                    out = out_alt
+                    err = err_alt
+                else:
+                    err_msg = err.decode("utf-8", errors="ignore").strip() if err else "host IPv4 not found"
+                    raise RuntimeError("Failed to get host IPv4 address: {}".format(err_msg))
+            else:
+                err_msg = err.decode("utf-8", errors="ignore").strip() if err else "mgt IPv4 not found"
+                if self._acl_iface_exists("host") or self._acl_iface_exists("hostmgmt"):
+                    return self._get_acl_ipv4("host")
+                raise RuntimeError("Failed to get mgt IPv4 address: {}".format(err_msg))
         output = out.decode("utf-8", errors="ignore")
         match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", output)
         if not match:
-            raise RuntimeError("Failed to parse mgt IPv4 address")
+            raise RuntimeError("Failed to parse {} IPv4 address".format(interface))
         return match.group(1)
+
+    @staticmethod
+    def _is_user_acl_rule_line(rule_line: str) -> bool:
+        if "AELLA_ACL_AUTO" in rule_line:
+            return False
+        return ACL_COMMENT_PREFIX.strip() in rule_line
 
     def _ensure_local_ip_allow_rules(self):
         """Ensure local interface IPs are always allowed"""
@@ -2197,9 +2944,9 @@ class AellaCli(cmd.Cmd, object):
         """
         Remove legacy destination-based allow rules that bypass deny-all:
           ACCEPT all 0.0.0.0/0 -> <host_ip> /* Local interface IP - always allow */
-        Keep only 127.0.0.1 and 192.168.0.100 if such legacy rules exist.
+        Keep only 127.0.0.1, 192.168.0.100, and 192.168.122.1 if such legacy rules exist.
         """
-        keep = {"127.0.0.1", "192.168.0.100"}
+        keep = {"127.0.0.1", "192.168.0.100", "192.168.122.1"}
         cmd = "sudo iptables -L INPUT -n -v --line-numbers"
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, _ = proc.communicate()
@@ -2233,17 +2980,7 @@ class AellaCli(cmd.Cmd, object):
 
     def _get_current_ssh_client_ip(self):
         """Get current SSH client IPv4 address if available"""
-        for env_key in ("SSH_CLIENT", "SSH_CONNECTION"):
-            env_val = os.environ.get(env_key)
-            if not env_val:
-                continue
-            tokens = env_val.strip().split()
-            candidate = tokens[0] if tokens else None
-            if not candidate:
-                continue
-            if self.valid_ipv4_address(candidate):
-                return candidate
-        return None
+        return self.get_current_ssh_client_ip()
 
     def _iptables_add_auto_ssh(self, ssh_ip):
         """Add auto-allow rule for current SSH client"""
@@ -2257,49 +2994,6 @@ class AellaCli(cmd.Cmd, object):
 
         cmd = "sudo iptables -I INPUT -s {} -p tcp --dport 22 {} -j ACCEPT".format(cidr, comment_part)
         subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-
-    def _ensure_default_accept_policy(self):
-        """Ensure default INPUT chain policy is ACCEPT if no user-defined ACL rules exist"""
-        try:
-            # Check current policy
-            cmd = "sudo iptables -L INPUT -n | head -1"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, _ = proc.communicate()
-            
-            if out:
-                policy_line = out.decode('utf-8', errors='ignore')
-                # Count user-defined ACL rules (excluding local IP allow rules)
-                # Get all rules and filter out local IP rules
-                cmd_list = "sudo iptables -L INPUT -n --line-numbers"
-                proc_list = subprocess.Popen(cmd_list, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out_list, _ = proc_list.communicate()
-                
-                user_rule_count = 0
-                if out_list:
-                    lines = out_list.decode('utf-8', errors='ignore').split('\n')
-                    local_ips = self._get_local_interface_ips()
-                    
-                    for line in lines:
-                        # Skip chain header and policy line
-                        if 'Chain' in line or 'policy' in line.lower() or not line.strip():
-                            continue
-                        # Skip local IP allow rules (destination-based rules)
-                        is_local_rule = False
-                        for local_ip in local_ips:
-                            if '-d {}'.format(local_ip) in line and 'ACCEPT' in line:
-                                is_local_rule = True
-                                break
-                        if not is_local_rule:
-                            user_rule_count += 1
-                
-                # If no user-defined rules exist, ensure policy is ACCEPT
-                if user_rule_count == 0:
-                    # Check if policy is already ACCEPT
-                    if 'ACCEPT' not in policy_line:
-                        cmd_set = "sudo iptables -P INPUT ACCEPT"
-                        subprocess.Popen(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        except Exception:
-            pass
 
     def _load_acl_staging(self):
         """Load staged ACL rules from file"""
@@ -2361,6 +3055,312 @@ class AellaCli(cmd.Cmd, object):
             except Exception:
                 pass
 
+    # =========================
+    # ACL HELPERS (NEW DESIGN)
+    # =========================
+
+    def _run_cmd(self, cmd: str) -> tuple[int, str, str]:
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        return proc.returncode, (out.decode("utf-8", errors="ignore") if out else ""), (err.decode("utf-8", errors="ignore") if err else "")
+
+    def _load_acl_state(self) -> dict:
+        default_data: dict = {}
+        try:
+            with open(ACL_STATE_PATH, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return default_data
+        except PermissionError:
+            rc, out, _ = self._run_cmd(f"sudo cat {shlex.quote(ACL_STATE_PATH)}")
+            if rc != 0 or not out:
+                return default_data
+            try:
+                data = json.loads(out)
+            except Exception:
+                return default_data
+        except Exception:
+            return default_data
+
+        if not isinstance(data, dict):
+            return default_data
+        mode = data.get("mode")
+        iface = data.get("iface")
+        if mode not in ("whitelist", "blacklist") or not iface:
+            return default_data
+        return data
+
+    def _save_acl_state(self, data: dict) -> None:
+        target_dir = os.path.dirname(ACL_STATE_PATH)
+        make_dir(target_dir, root=True)
+        payload = json.dumps(data, indent=2, sort_keys=False)
+        tmp_path = "/tmp/acl_state.json"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(payload)
+            self._run_cmd(f"sudo mv {shlex.quote(tmp_path)} {shlex.quote(ACL_STATE_PATH)}")
+        except Exception:
+            self._run_cmd(f"echo {shlex.quote(payload)} | sudo tee {shlex.quote(ACL_STATE_PATH)} >/dev/null")
+
+    def _clear_acl_state(self) -> None:
+        self._run_cmd(f"sudo rm -f {shlex.quote(ACL_STATE_PATH)}")
+
+    def _get_iface_ipv4(self, iface: str) -> str:
+        # 반드시 ip -4 addr show dev <iface> 로만 취득
+        rc, out, err = self._run_cmd(f"ip -4 addr show dev {shlex.quote(iface)}")
+        if rc != 0 or not out:
+            raise RuntimeError(f"Failed to get IPv4 for iface={iface}: {err.strip()}")
+        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", out)
+        if not m:
+            raise RuntimeError(f"No IPv4 found on iface={iface}")
+        return m.group(1)
+
+    def _list_acl_candidate_ifaces(self) -> list[tuple[str, str]]:
+        """
+        Return list of (iface, ipv4) candidates:
+          - has IPv4
+          - exclude iface whose IPv4 in ACL_EXCLUDE_IPS (192.168.0.100, 192.168.122.1)
+          - exclude lo
+        """
+        candidates: list[tuple[str, str]] = []
+        try:
+            for name in os.listdir("/sys/class/net"):
+                if name == "lo":
+                    continue
+                try:
+                    ip = self._get_iface_ipv4(name)
+                except Exception:
+                    continue
+                if ip in ACL_EXCLUDE_IPS:
+                    continue
+                candidates.append((name, ip))
+        except Exception:
+            pass
+        return candidates
+
+    def _iptables_chain_exists(self, chain: str) -> bool:
+        rc, _, _ = self._run_cmd(f"sudo iptables -S {shlex.quote(chain)}")
+        return rc == 0
+
+    def _iptables_ensure_chain(self, chain: str) -> None:
+        if self._iptables_chain_exists(chain):
+            return
+        self._run_cmd(f"sudo iptables -N {shlex.quote(chain)}")
+
+    def _iptables_flush_chain(self, chain: str) -> None:
+        if not self._iptables_chain_exists(chain):
+            return
+        self._run_cmd(f"sudo iptables -F {shlex.quote(chain)}")
+
+    def _iptables_delete_chain(self, chain: str) -> None:
+        if not self._iptables_chain_exists(chain):
+            return
+        # must be flushed and unreferenced
+        self._run_cmd(f"sudo iptables -F {shlex.quote(chain)}")
+        self._run_cmd(f"sudo iptables -X {shlex.quote(chain)}")
+
+    def _iptables_rule_check(self, table_chain: str, rule_args: str) -> bool:
+        # iptables -C <chain> <args>
+        rc, _, _ = self._run_cmd(f"sudo iptables -C {shlex.quote(table_chain)} {rule_args}")
+        return rc == 0
+
+    def _iptables_rule_insert(self, table_chain: str, position: int | None, rule_args: str) -> None:
+        if position is None:
+            cmd = f"sudo iptables -A {shlex.quote(table_chain)} {rule_args}"
+        else:
+            cmd = f"sudo iptables -I {shlex.quote(table_chain)} {position} {rule_args}"
+        self._run_cmd(cmd)
+
+    def _iptables_rule_delete(self, table_chain: str, rule_args: str) -> None:
+        self._run_cmd(f"sudo iptables -D {shlex.quote(table_chain)} {rule_args}")
+
+    def _ensure_aella_system_rules(self, iface: str) -> None:
+        """
+        Ensure ONLY when applying (rules exist):
+          - INPUT top: ESTABLISHED,RELATED accept (with comment)
+          - INPUT: jump to AELLA_INPUT for selected iface (with comment)
+          - AELLA_INPUT chain exists
+        """
+        self._iptables_ensure_chain(AELLA_INPUT_CHAIN)
+
+        est_args = f'-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "{AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT}"'
+        if not self._iptables_rule_check("INPUT", est_args):
+            # place at very top
+            self._iptables_rule_insert("INPUT", 1, est_args)
+
+        jump_args = f'-i {shlex.quote(iface)} -j {AELLA_INPUT_CHAIN} -m comment --comment "{AELLA_SYSTEM_JUMP_COMMENT}"'
+        if not self._iptables_rule_check("INPUT", jump_args):
+            # place just after established if possible
+            self._iptables_rule_insert("INPUT", 2, jump_args)
+
+    def _remove_aella_system_rules(self) -> None:
+        """
+        Remove AELLA-managed rules from INPUT and delete chain.
+        Used ONLY by: set acl policy (re-init).
+        """
+        # delete jump rules (may exist multiple times)
+        rc, out, _ = self._run_cmd("sudo iptables -S INPUT")
+        if rc == 0 and out:
+            for line in out.splitlines():
+                if not line.startswith("-A INPUT"):
+                    continue
+                if AELLA_SYSTEM_JUMP_COMMENT in line or AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line:
+                    del_line = line.replace("-A INPUT", "-D INPUT", 1)
+                    self._run_cmd("sudo iptables " + del_line)
+
+        # flush/delete chain
+        self._iptables_delete_chain(AELLA_INPUT_CHAIN)
+
+    def _build_user_rule_args(self, iface: str, iface_ip: str, action: str, source: str, port: str, desc: str) -> str:
+        """
+        Build rule args for AELLA_INPUT_CHAIN.
+        MUST include -d <iface_ip>/32 always.
+        MUST include comment with ACL_COMMENT_PREFIX.
+        """
+        target = "ACCEPT" if action == "allow" else "DROP"
+        iface_part = f"-i {shlex.quote(iface)}"
+        dest_part = f"-d {iface_ip}/32"
+        any_source = source in ("0.0.0.0/0", "0.0.0.0")
+        comment_value = (ACL_COMMENT_PREFIX + (desc or "").strip()).strip()
+        escaped_comment = comment_value.replace('"', '\\"')
+        comment_part = f'-m comment --comment "{escaped_comment}"'
+
+        src_part = "" if any_source else f"-s {source}"
+        if port == "all":
+            proto_part = ""
+        elif port in ("icmp", "ping"):
+            proto_part = "-p icmp --icmp-type echo-request"
+        else:
+            proto_part = f"-p tcp --dport {port}"
+
+        args = " ".join(x for x in [iface_part, src_part, dest_part, proto_part, "-j " + target, comment_part] if x).strip()
+        return args
+
+    def _normalize_acl_source(self, source: str | None) -> str | None:
+        if not source:
+            return None
+        if source in ("0.0.0.0/0", "0.0.0.0"):
+            return None
+        if "/" not in source:
+            return f"{source}/32"
+        return source
+
+    def _port_to_proto_dport(self, port: str) -> tuple[str | None, str | None]:
+        if port == "all":
+            return (None, None)
+        if port in ("icmp", "ping"):
+            return ("icmp", None)
+        return ("tcp", str(port))
+
+    def _user_rule_exists_in_chain(self, chain_rules: list[dict], action: str, source: str, port: str) -> bool:
+        target = "ACCEPT" if action == "allow" else "DROP"
+        src_norm = self._normalize_acl_source(source)
+        proto, dport = self._port_to_proto_dport(port)
+        for rule in chain_rules:
+            if rule.get("target") != target:
+                continue
+            rule_src = rule.get("src")
+            if src_norm is None:
+                if rule_src not in (None, "0.0.0.0/0", "0.0.0.0"):
+                    continue
+            else:
+                if rule_src != src_norm:
+                    continue
+            if proto is None:
+                if rule.get("proto") is not None:
+                    continue
+            else:
+                if rule.get("proto") != proto:
+                    continue
+            if dport is None:
+                if rule.get("dport") is not None:
+                    continue
+            else:
+                if rule.get("dport") != dport:
+                    continue
+            return True
+        return False
+
+    def _append_user_rule_summary(self, chain_rules: list[dict], action: str, source: str, port: str) -> None:
+        target = "ACCEPT" if action == "allow" else "DROP"
+        src_norm = self._normalize_acl_source(source)
+        proto, dport = self._port_to_proto_dport(port)
+        chain_rules.append(
+            {
+                "raw": "",
+                "src": src_norm,
+                "proto": proto,
+                "dport": dport,
+                "target": target,
+                "comment": None,
+            }
+        )
+
+    def _ensure_default_tail_rule_last(self, mode: str, iface_ip: str) -> None:
+        # remove existing default tail first (both types), then append correct one
+        rc, out, _ = self._run_cmd(f"sudo iptables -S {AELLA_INPUT_CHAIN}")
+        if rc == 0 and out:
+            for line in out.splitlines():
+                if not line.startswith(f"-A {AELLA_INPUT_CHAIN}"):
+                    continue
+                if AELLA_DEFAULT_WHITELIST_COMMENT in line or AELLA_DEFAULT_BLACKLIST_COMMENT in line:
+                    del_line = line.replace(f"-A {AELLA_INPUT_CHAIN}", f"-D {AELLA_INPUT_CHAIN}", 1)
+                    self._run_cmd("sudo iptables " + del_line)
+
+        if mode == "whitelist":
+            tail_args = f'-d {iface_ip}/32 -j DROP -m comment --comment "{AELLA_DEFAULT_WHITELIST_COMMENT}"'
+        else:
+            tail_args = f'-d {iface_ip}/32 -j ACCEPT -m comment --comment "{AELLA_DEFAULT_BLACKLIST_COMMENT}"'
+
+        # append only if not exists
+        if not self._iptables_rule_check(AELLA_INPUT_CHAIN, tail_args):
+            self._iptables_rule_insert(AELLA_INPUT_CHAIN, None, tail_args)
+
+    def _detect_ssh_client_ip(self) -> str | None:
+        return self._get_current_ssh_client_ip()
+
+    def _client_ip_in_cidr(self, client_ip: str, cidr: str) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(client_ip)
+            net_obj = ipaddress.ip_network(cidr, strict=False)
+            return ip_obj in net_obj
+        except Exception:
+            return False
+
+    def _compute_whitelist_ssh_risk(self, client_ip: str | None, staged_rules: list[dict]) -> tuple[str, str]:
+        """
+        Returns (risk_level, message).
+        HIGH if cannot prove client_ip has allow rule for tcp/22 or all.
+        """
+        if not client_ip:
+            return ("HIGH", "Unable to detect current SSH client IP. Applying ACL may terminate your session and block future access.")
+
+        # Need a rule that allows client_ip and includes port 22 or all.
+        for r in staged_rules:
+            if r.get("action") != "allow":
+                continue
+            src = r.get("source", "0.0.0.0/0")
+            ports = r.get("ports", [])
+            if not ports:
+                continue
+            if not ("all" in ports or "22" in ports):
+                continue
+            # Match source
+            if src in ("0.0.0.0/0", "0.0.0.0"):
+                # allow any -> safe for ssh
+                return ("LOW", f"Current SSH client IP {client_ip} will be allowed (0.0.0.0/0 includes SSH).")
+            if "/" in src:
+                if self._client_ip_in_cidr(client_ip, src):
+                    return ("LOW", f"Current SSH client IP {client_ip} is included in allow CIDR {src} for SSH.")
+            else:
+                if client_ip == src:
+                    return ("LOW", f"Current SSH client IP {client_ip} is explicitly allowed for SSH.")
+        return ("HIGH", f"Your current SSH client IP {client_ip} is NOT allowed for SSH(22). Applying may terminate your session and lock you out.")
+
+    def _confirm_yes(self, prompt: str) -> bool:
+        val = input(prompt).strip()
+        return val == "YES"
+
     def _clear_acl_staging(self):
         """Clear staged ACL rules"""
         self._save_acl_staging({"rules": []})
@@ -2376,77 +3376,48 @@ class AellaCli(cmd.Cmd, object):
             "desc": desc or "",
         }
         for rule in rules:
-            if (
-                rule.get("action") == staged_rule["action"]
-                and rule.get("source") == staged_rule["source"]
-                and rule.get("ports") == staged_rule["ports"]
-                and rule.get("desc") == staged_rule["desc"]
-            ):
+            if rule.get("action") == staged_rule["action"] and rule.get("source") == staged_rule["source"] and rule.get("ports") == staged_rule["ports"]:
                 return False
         rules.append(staged_rule)
         data["rules"] = rules
         self._save_acl_staging(data)
         return True
 
-    def _iptables_add(self, action, source, ports, desc):
+    def _iptables_add(self, action, source, ports, desc, dest_ip=None):
         """Add ACL rules to iptables with comment prefix"""
-        mgt_ip = self._get_mgt_ipv4()
-        dest_part = "-d {}/32".format(mgt_ip)
+        if not dest_ip:
+            dest_ip = self._get_mgt_ipv4()
+        dest_part = "-d {}/32".format(dest_ip)
         comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
         escaped_comment = comment_value.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
         comment_part = '-m comment --comment "{}"'.format(escaped_comment)
         any_source = source in ("0.0.0.0/0", "0.0.0.0")
 
         for port in ports:
+            if self._iptables_rule_exists(action, source, port, dest_ip=dest_ip):
+                continue
             if port == 'all':
                 if action == 'allow':
                     if any_source:
                         cmd = "sudo iptables -I INPUT {} {} -j ACCEPT".format(dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 {} -j ACCEPT".format(dest_part)
                     else:
                         cmd = "sudo iptables -I INPUT -s {} {} {} -j ACCEPT".format(source, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} {} -j ACCEPT".format(source, dest_part)
                 else:
                     if any_source:
                         cmd = "sudo iptables -I INPUT {} {} -j DROP".format(dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 {} -j DROP".format(dest_part)
                     else:
                         cmd = "sudo iptables -I INPUT -s {} {} {} -j DROP".format(source, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} {} -j DROP".format(source, dest_part)
             else:
                 if action == 'allow':
                     if any_source:
                         cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j ACCEPT".format(port, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} {} -j ACCEPT".format(port, dest_part)
                     else:
                         cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j ACCEPT".format(source, port, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} {} -j ACCEPT".format(source, port, dest_part)
                 else:
                     if any_source:
                         cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j DROP".format(port, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s 0.0.0.0/0 -p tcp --dport {} {} -j DROP".format(port, dest_part)
                     else:
                         cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j DROP".format(source, port, dest_part, comment_part).strip()
-                        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport {} {} -j DROP".format(source, port, dest_part)
-
-            check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            check_proc.communicate()
-            if check_proc.returncode == 0:
-                continue
-
-            if any_source:
-                if port == 'all':
-                    alt_check_cmd = "sudo iptables -C INPUT {} -j {}".format(
-                        dest_part, "ACCEPT" if action == "allow" else "DROP"
-                    )
-                else:
-                    alt_check_cmd = "sudo iptables -C INPUT -p tcp --dport {} {} -j {}".format(
-                        port, dest_part, "ACCEPT" if action == "allow" else "DROP"
-                    )
-                alt_proc = subprocess.Popen(alt_check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                alt_proc.communicate()
-                if alt_proc.returncode == 0:
-                    continue
 
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
@@ -2456,13 +3427,13 @@ class AellaCli(cmd.Cmd, object):
                     cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
                     subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
-    def _iptables_rule_exists(self, action, source, port, mgt_ip=None):
+    def _iptables_rule_exists(self, action, source, port, dest_ip=None):
         """Check if a semantically equivalent rule already exists via iptables -C"""
         target = "ACCEPT" if action == "allow" else "DROP"
         any_source = source in ("0.0.0.0/0", "0.0.0.0")
-        if not mgt_ip:
-            mgt_ip = self._get_mgt_ipv4()
-        dest_part = "-d {}/32".format(mgt_ip)
+        if not dest_ip:
+            dest_ip = self._get_mgt_ipv4()
+        dest_part = "-d {}/32".format(dest_ip)
 
         base_parts = ["sudo iptables -C INPUT", dest_part]
         if port != "all":
@@ -2499,193 +3470,289 @@ class AellaCli(cmd.Cmd, object):
         for line in lines:
             if not line.startswith("-A INPUT"):
                 continue
-            if ACL_COMMENT_PREFIX.strip() not in line:
+            if not self._is_user_acl_rule_line(line):
                 continue
             del_cmd = "sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1)
             subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
     def set_acl_callback(self, key, param):
-        """Configure iptables ACL rules
-        Usage: set acl allow <IP/network> <port> [port2 ...] | all [description]
-               set acl deny <IP/network> <port> [port2 ...] | all [description]
-               set acl apply [--reset]
         """
+        NEW ACL UX:
+
+          set acl policy
+          set acl <IP/network> <port|icmp|ping> [...] | all [description]
+          set acl apply [--reset]
+
+        IMPORTANT:
+          - policy only sets mode/iface, DOES NOT touch iptables.
+          - apply does NOTHING if staged rules are empty (no iptables changes at all).
+        """
+        # -----------------------
+        # Helper: print usage
+        # -----------------------
+        def _print_usage(policy_missing: bool):
+            print("")
+            if policy_missing:
+                print("ACL policy is not initialized.")
+                print("You must run 'set acl policy' before adding or applying any ACL rules.")
+                print("")
+            print("------------------------------------------------------------")
+            print("Required first step:")
+            print("  set acl policy        Initialize ACL mode (whitelist/blacklist) and target interface")
+            print("")
+            print("------------------------------------------------------------")
+            print("ACL rule syntax (available after policy is initialized):")
+            print("  set acl <IP/network> <port|icmp|ping|all> [description]")
+            print("")
+            print("  IP/network : IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)")
+            print("  port       : Port number (e.g., 22, 80, 443), \"icmp\"/\"ping\", or \"all\" for all ports")
+            print("               Multiple ports can be specified separated by space")
+            print("  description: Optional description/comment")
+            print("")
+            print("------------------------------------------------------------")
+            print("Apply staged rules (rules must exist):")
+            print("  set acl apply          Apply staged ACL rules (merge)")
+            print("  set acl apply --reset  Reset applied ACL rules and rebuild from staging")
+            print("")
+            print("------------------------------------------------------------")
+            print("Examples:")
+            print("  set acl policy")
+            print("  set acl 192.168.1.100 22 \"Admin SSH access\"")
+            print("  set acl 192.168.1.0/24 80 443 \"Web servers\"")
+            print("  set acl 10.0.0.0/8 all \"Internal network\"")
+            print("  set acl apply")
+            print("")
+
+        # no args => show usage (policy-first)
         if not param:
-            print('\n<action> <IP/network> <port> [...] | all [description]  Configure ACL rule')
-            print('  action: allow or deny')
-            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
-            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
-            print('  Multiple ports can be specified separated by space')
-            print('  description: Optional description/comment for this rule')
-            print('  apply: Apply staged ACL rules (merge)')
-            print('  apply --reset: Reset user ACL rules and rebuild from staging')
-            print('\nExamples:')
-            print('  set acl allow 192.168.1.100 22 "Admin SSH access"')
-            print('  set acl allow 192.168.1.0/24 80 443 "Web servers"')
-            print('  set acl allow 10.0.0.0/8 all "Internal network"')
-            print('  set acl deny 192.168.1.200 22 "Blocked user"')
-            print('  set acl apply')
-            print('  set acl apply --reset\n')
+            state = self._load_acl_state()
+            _print_usage(policy_missing=(not state))
             return
 
-        if param[0].lower() == 'apply':
-            reset = False
-            if len(param) > 2:
-                print('Invalid option: use "set acl apply" or "set acl apply --reset"\n')
+        # -----------------------
+        # set acl policy
+        # -----------------------
+        if param[0].lower() == "policy":
+            warning = (
+                "\nWARNING: Re-initializing ACL policy will DELETE ALL existing AELLA ACL rules (live) and staged rules.\n"
+                "This action cannot be undone.\n\n"
+                "Type YES to continue: "
+            )
+            if not self._confirm_yes(warning):
+                print("\nCanceled.\n")
                 return
-            if len(param) == 2:
-                if param[1] != '--reset':
-                    print('Invalid option: use "set acl apply" or "set acl apply --reset"\n')
-                    return
-                reset = True
 
-            self._ensure_default_accept_policy()
-            self._ensure_established_related_rule()
+            # destructive cleanup
+            self._clear_acl_staging()
+            self._clear_acl_state()
+            self._remove_aella_system_rules()
+
+            # select mode
+            print("\nSelect ACL mode:")
+            print("  1) whitelist  (specified sources are ALLOWED, all others are DENIED)")
+            print("  2) blacklist  (specified sources are DENIED, all others are ALLOWED)")
+            mode_sel = input("Enter 1 or 2: ").strip()
+            if mode_sel not in ("1", "2"):
+                print("\nInvalid selection. Canceled.\n")
+                return
+            mode = "whitelist" if mode_sel == "1" else "blacklist"
+
+            # select iface (single)
+            candidates = self._list_acl_candidate_ifaces()
+            if not candidates:
+                print("\nNo eligible interfaces found (IPv4 required; excluding 192.168.0.100, 192.168.122.1).\n")
+                return
+
+            print("\nSelect target interface (exactly ONE):")
+            for idx, (ifn, ip) in enumerate(candidates, start=1):
+                print(f"  {idx}) {ifn}  (IPv4: {ip})")
+            sel = input("Enter number: ").strip()
+            if not sel.isdigit() or not (1 <= int(sel) <= len(candidates)):
+                print("\nInvalid selection. Canceled.\n")
+                return
+            iface, iface_ip = candidates[int(sel) - 1]
+
+            self._save_acl_state({"mode": mode, "iface": iface, "iface_ip": iface_ip})
+            print("\nPolicy saved.")
+            print("  mode : {}".format(mode))
+            print("  iface: {} (IPv4: {})".format(iface, iface_ip))
+            print("\nNOTE: No firewall rules are active until at least one ACL rule is added and 'set acl apply' is executed.\n")
+            return
+
+        # -----------------------
+        # set acl apply [--reset]
+        # -----------------------
+        if param[0].lower() == "apply":
+            # policy must exist
+            state = self._load_acl_state()
+            if not state:
+                print("\nACL policy is not initialized. Run 'set acl policy' first.\n")
+                return
+
+            # parse options
+            reset = False
+            tokens = param[1:]
+            for t in tokens:
+                if t == "--reset":
+                    reset = True
+                else:
+                    print("\nInvalid option. Use: set acl apply [--reset]\n")
+                    return
 
             data = self._load_acl_staging()
             rules = data.get("rules", [])
-            if reset:
-                self._iptables_delete_user_rules()
-                self._purge_legacy_local_always_allow_rules()
-
-            self._ensure_local_ip_allow_rules()
-            ssh_ip = self._get_current_ssh_client_ip()
-            if ssh_ip:
-                self._iptables_add_auto_ssh(ssh_ip)
-
-            try:
-                mgt_ip = self._get_mgt_ipv4()
-            except Exception as e:
-                print('Failed to apply ACL rules: {}\n'.format(e))
+            if not rules:
+                print("\nNo ACL rules defined. Nothing to apply.")
+                print("Policy-only does not enforce allow/deny all. (No iptables changes were made.)\n")
                 return
 
-            for rule in rules:
-                action = rule.get("action")
-                source = rule.get("source")
-                ports = rule.get("ports", [])
-                desc = rule.get("desc", "")
-                if action in ['allow', 'deny'] and source and ports:
-                    for port in ports:
-                        if self._iptables_rule_exists(action, source, port, mgt_ip=mgt_ip):
-                            continue
-                        self._iptables_add(action, source, [port], desc)
+            # SSH risk warning (mandatory)
+            mode = state["mode"]
+            client_ip = self._detect_ssh_client_ip()
+            if mode == "whitelist":
+                risk_level, risk_msg = self._compute_whitelist_ssh_risk(client_ip, rules)
+                print("\n[SSH Safety Check]")
+                print(risk_msg)
+                if risk_level == "HIGH":
+                    if not self._confirm_yes("\nType YES to apply anyway (HIGH RISK): "):
+                        print("\nCanceled. No changes applied.\n")
+                        return
+                else:
+                    if not self._confirm_yes("\nType YES to apply: "):
+                        print("\nCanceled. No changes applied.\n")
+                        return
+            else:
+                # blacklist: still warn generally
+                print("\n[SSH Safety Check]")
+                if client_ip:
+                    print(f"Current SSH client IP detected: {client_ip}")
+                print("Applying ACL may terminate your current session depending on rules.")
+                if not self._confirm_yes("\nType YES to apply: "):
+                    print("\nCanceled. No changes applied.\n")
+                    return
+
+            # APPLY (rules exist -> now allowed to touch iptables)
+            iface = state["iface"]
+            iface_ip = self._get_iface_ipv4(iface)
+
+            # ensure base system rules and chain/jump
+            self._ensure_aella_system_rules(iface)
 
             if reset:
-                print('Applied staged ACL rules with reset (rebuild completed).\n')
-            else:
-                print('Applied staged ACL rules (merge completed).\n')
+                self._iptables_flush_chain(AELLA_INPUT_CHAIN)
+
+            # add user rules (append order)
+            _, existing_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+            for r in rules:
+                action = r.get("action")
+                source = r.get("source")
+                ports = r.get("ports", [])
+                desc = r.get("desc", "")
+                if not action or not source or not ports:
+                    continue
+                for p in ports:
+                    if self._user_rule_exists_in_chain(existing_rules, action, source, p):
+                        continue
+                    args = self._build_user_rule_args(iface, iface_ip, action, source, p, desc)
+                    if not self._iptables_rule_check(AELLA_INPUT_CHAIN, args):
+                        self._iptables_rule_insert(AELLA_INPUT_CHAIN, None, args)
+                        self._append_user_rule_summary(existing_rules, action, source, p)
+
+            # ensure default tail last
+            self._ensure_default_tail_rule_last(state["mode"], iface_ip)
+
+            # clear staging after successful apply
             self._clear_acl_staging()
-            print('Staging cleared.\n')
+            if reset:
+                print("\nApplied staged ACL rules with reset (rebuild completed).")
+            else:
+                print("\nApplied staged ACL rules (merge completed).")
+            print("Staging cleared.\n")
             return
 
-        if len(param) < 3:
-            print('\n<action> <IP/network> <port> [...] | all [description]  Configure ACL rule')
-            print('  action: allow or deny')
-            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
-            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
-            print('  Multiple ports can be specified separated by space')
-            print('  description: Optional description/comment for this rule')
-            print('\nExamples:')
-            print('  set acl allow 192.168.1.100 22 "Admin SSH access"')
-            print('  set acl allow 192.168.1.0/24 80 443 "Web servers"')
-            print('  set acl allow 10.0.0.0/8 all "Internal network"')
-            print('  set acl deny 192.168.1.200 22 "Blocked user"\n')
+        # -----------------------
+        # set acl <src> <ports...|all> [desc]
+        # -----------------------
+        state = self._load_acl_state()
+        if not state:
+            print("\nACL policy is not initialized. Run 'set acl policy' first.\n")
             return
-        
-        action = param[0].lower()
-        if action not in ['allow', 'deny']:
-            print('Invalid action: Must be "allow" or "deny"\n')
-            return
-        
-        source = param[1]
+
+        # param[0] must be source
+        source = param[0]
         # Validate IP/network
-        if '/' in source:
-            # Network CIDR format
-            parts = source.split('/')
+        if "/" in source:
+            parts = source.split("/")
             if not self.valid_ipv4_address(parts[0]) or not parts[1].isdigit() or int(parts[1]) > 32:
-                print('Invalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n')
+                print("\nInvalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n")
                 return
         else:
-            # Single IP
             if not self.valid_ipv4_address(source):
-                print('Invalid IP address format: {}\n'.format(source))
+                print("\nInvalid IP address format: {}\n".format(source))
                 return
-        
-        # Extract ports and description
-        # Description is the last parameter if it's not a port number and not "all"
-        remaining_params = param[2:]
-        if not remaining_params:
-            print('Port specification required\n')
+
+        if len(param) < 2:
+            print("\nPort specification required.\n")
             return
-        
-        ports = []
-        description = None
-        
-        # Simple logic: collect ports until we hit a non-port parameter
-        # Then treat the rest as description
-        for i, p in enumerate(remaining_params):
-            # If it's "all" or a digit, it's a port
-            if p == 'all' or p.isdigit():
+
+        remaining = param[1:]
+        ports: list[str] = []
+        description: str | None = None
+
+        for i, p in enumerate(remaining):
+            if p == "all" or p in ("icmp", "ping") or p.isdigit():
                 ports.append(p)
             else:
-                # First non-port parameter - treat rest as description
-                description = ' '.join(remaining_params[i:])
+                description = " ".join(remaining[i:])
                 break
-        
+
         if not ports:
-            print('Port specification required\n')
+            print("\nPort specification required.\n")
             return
-        
-        # Check if "all" is specified
-        if 'all' in ports:
+
+        if "all" in ports:
             if len(ports) > 1:
-                print('Cannot specify "all" with other ports\n')
+                print('\nCannot specify "all" with other ports\n')
                 return
-            ports = ['all']
-        
-        # Clean up description (remove quotes)
+            ports = ["all"]
+
+        if ports != ["all"]:
+            normalized_ports = []
+            for p in ports:
+                p = "icmp" if p == "ping" else p
+                if p not in normalized_ports:
+                    normalized_ports.append(p)
+            ports = normalized_ports
+
+        # validate ports
+        if ports != ["all"]:
+            for p in ports:
+                if p in ("icmp", "ping"):
+                    continue
+                try:
+                    n = int(p)
+                    if n < 1 or n > 65535:
+                        print("\nInvalid port number: {} (must be 1-65535)\n".format(p))
+                        return
+                except Exception:
+                    print("\nInvalid port number: {}\n".format(p))
+                    return
+
         if description:
             description = description.strip('"').strip("'").strip()
-        
-        # Get local interface IPs
-        local_ips = self._get_local_interface_ips()
-        
-        # For deny rules, check if source IP matches any local interface IP
-        # If so, skip adding the deny rule (local IPs should never be blocked)
-        if action == 'deny':
-            if source in local_ips:
-                print('Cannot deny traffic from/to local interface IP: {} (always allowed)\n'.format(source))
-                return
-            # Also check if source is a network that includes local IPs
-            if '/' in source:
-                # Check if any local IP is in the specified network
-                for local_ip in local_ips:
-                    # Simple check: if local IP starts with network prefix
-                    network_base = source.split('/')[0]
-                    network_prefix = network_base.rsplit('.', 1)[0] if '.' in network_base else network_base
-                    local_ip_prefix = local_ip.rsplit('.', 1)[0] if '.' in local_ip else local_ip
-                    if network_prefix == local_ip_prefix:
-                        print('Warning: Network {} may include local interface IPs. Deny rule may not block local IP traffic.\n'.format(source))
-                        break
-        
-        # Validate port numbers
-        if ports != ['all']:
-            for port in ports:
-                try:
-                    port_num = int(port)
-                    if port_num < 1 or port_num > 65535:
-                        print('Invalid port number: {} (must be 1-65535)\n'.format(port))
-                        return
-                except ValueError:
-                    print('Invalid port number: {}\n'.format(port))
-                    return
+
+        # derive action by mode
+        mode = state["mode"]
+        action = "allow" if mode == "whitelist" else "deny"
 
         staged = self._stage_rule(action, source, ports, description)
         if staged:
-            desc_out = description if description else ""
-            print('Staged: {} {} {} ({})\n'.format(action, source, " ".join(ports), desc_out))
+            if mode == "whitelist":
+                print('Staged (ALLOW/whitelist): {} {} ({})\n'.format(source, " ".join(ports), description or ""))
+            else:
+                print('Staged (DENY/blacklist): {} {} ({})\n'.format(source, " ".join(ports), description or ""))
         else:
-            print('ACL rule already staged: {} {} {}\n'.format(action, source, " ".join(ports)))
+            print("ACL rule already staged.\n")
 
     def unset_ntp_callback(self, key, param):
         if not param or param[0].endswith('?') or len(param) < 1:
@@ -2789,170 +3856,133 @@ class AellaCli(cmd.Cmd, object):
             return 1
 
     def unset_acl_callback(self, key, param):
-        """Remove iptables ACL rules
-        Usage: unset acl <IP/network> <port> [port2 ...] | all
+        """
+        NEW:
+          unset acl <IP/network> <port|icmp|ping> [...] | all
+
+        Removes from BOTH:
+          - staging
+          - live AELLA_INPUT_CHAIN (only AELLA-managed user rules)
         """
         if not param or len(param) < 2:
-            print('\n<IP/network> <port> [...] | all  Remove ACL rule')
-            print('  IP/network: IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
-            print('  port: Port number (e.g., 22, 80, 443) or "all" for all ports')
-            print('  Multiple ports can be specified separated by space')
-            print('  Note: Local interface IP rules cannot be removed')
-            print('\nExamples:')
-            print('  unset acl 192.168.1.100 22')
-            print('  unset acl 192.168.1.0/24 80 443')
-            print('  unset acl 10.0.0.0/8 all\n')
+            print("\n<IP/network> <port|icmp|ping> [...] | all  Remove ACL rule")
+            print("Examples:")
+            print("  unset acl 192.168.1.100 22")
+            print("  unset acl 192.168.1.0/24 80 443")
+            print("  unset acl 10.0.0.0/8 all\n")
             return
-        
+
+        state = self._load_acl_state()
+        if not state:
+            print("\nACL policy is not initialized. Run 'set acl policy' first.\n")
+            return
+
         source = param[0]
-        # Validate IP/network
-        if '/' in source:
-            # Network CIDR format
-            parts = source.split('/')
+        if "/" in source:
+            parts = source.split("/")
             if not self.valid_ipv4_address(parts[0]) or not parts[1].isdigit() or int(parts[1]) > 32:
-                print('Invalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n')
+                print("\nInvalid network format: Use CIDR notation (e.g., 192.168.1.0/24)\n")
                 return
         else:
-            # Single IP
             if not self.valid_ipv4_address(source):
-                print('Invalid IP address format: {}\n'.format(source))
+                print("\nInvalid IP address format: {}\n".format(source))
                 return
-        
-        # Check if trying to remove local interface IP rule
-        local_ips = self._get_local_interface_ips()
-        if source in local_ips:
-            print('Cannot remove local interface IP rule: {} (always allowed)\n'.format(source))
-            return
-        
+
         ports = param[1:]
-        if not ports:
-            print('Port specification required\n')
-            return
-        
-        # Check if "all" is specified
-        if 'all' in ports:
+        if "all" in ports:
             if len(ports) > 1:
-                print('Cannot specify "all" with other ports\n')
+                print('\nCannot specify "all" with other ports\n')
                 return
-            ports = ['all']
-        
+            ports = ["all"]
+        else:
+            # validate port numbers
+            for p in ports:
+                if p in ("icmp", "ping"):
+                    continue
+                if not p.isdigit():
+                    print("\nInvalid port: {}\n".format(p))
+                    return
+                n = int(p)
+                if n < 1 or n > 65535:
+                    print("\nInvalid port number: {} (must be 1-65535)\n".format(p))
+                    return
+
+            normalized_ports = []
+            for p in ports:
+                p = "icmp" if p == "ping" else p
+                if p not in normalized_ports:
+                    normalized_ports.append(p)
+            ports = normalized_ports
+
+        # 1) remove from staging
+        data = self._load_acl_staging()
+        rules = data.get("rules", [])
+        before = len(rules)
+        # match by source+ports regardless of action/desc
+        new_rules = [r for r in rules if not (r.get("source") == source and r.get("ports") == ports)]
+        data["rules"] = new_rules
+        self._save_acl_staging(data)
+        staged_removed = before - len(new_rules)
+
+        # 2) remove from live chain (only AELLA user rules)
+        live_removed = 0
+        iface = state["iface"]
+        iface_ip = None
         try:
-            # Remove iptables rules
-            live_removed_count = 0
-            staged_removed_count = 0
+            iface_ip = self._get_iface_ipv4(iface)
+        except Exception:
+            iface_ip = None
 
-            # Load current rules once for live deletion
-            mgt_ip = self._get_mgt_ipv4()
-            dest_cidr = "{}/32".format(mgt_ip)
-            cmd = "sudo iptables -S INPUT"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-            rule_lines = out.decode('utf-8', errors='ignore').split('\n') if out else []
+        if iface_ip and self._iptables_chain_exists(AELLA_INPUT_CHAIN):
+            # delete rules by reconstructing rule args; try both -s omitted and -s 0.0.0.0/0 when any
+            mode = state["mode"]
+            action = "allow" if mode == "whitelist" else "deny"
 
-            def _is_excluded_rule(rule_line):
-                if ACL_COMMENT_PREFIX.strip() not in rule_line:
-                    return True
-                if "-d {}".format(dest_cidr) not in rule_line:
-                    return True
-                return False
-
-            # Build deletion commands from rule specs
-            any_source = source in ("0.0.0.0/0", "0.0.0.0")
-            delete_cmds = []
-            for port in ports:
-                if port == 'all':
-                    for line in rule_lines:
-                        if not line.startswith("-A INPUT"):
+            for p in ports:
+                desc_candidates = [""]  # we don't know desc; we will delete by scanning and matching -s/-d/--dport/-j and prefix.
+                # Safer approach: scan -S chain and delete matching lines
+                rc, out, _ = self._run_cmd(f"sudo iptables -S {AELLA_INPUT_CHAIN}")
+                if rc == 0 and out:
+                    for line in out.splitlines():
+                        if not line.startswith(f"-A {AELLA_INPUT_CHAIN}"):
                             continue
-                        if "-j ACCEPT" not in line and "-j DROP" not in line:
+                        if ACL_COMMENT_PREFIX.strip() not in line:
                             continue
-                        if any_source:
-                            if "-s " in line and "-s 0.0.0.0/0" not in line:
+                        if "-d {}/32".format(iface_ip) not in line:
+                            continue
+                        # port match
+                        if p == "all":
+                            if "--dport" in line:
                                 continue
                         else:
-                            if "-s {}".format(source) not in line:
+                            if p in ("icmp", "ping"):
+                                if "-p icmp" not in line:
+                                    continue
+                                if "--icmp-type" in line and "--icmp-type 8" not in line and "--icmp-type echo-request" not in line:
+                                    continue
+                            elif f"--dport {p}" not in line:
                                 continue
-                        if _is_excluded_rule(line):
+                        # target match
+                        want_target = "ACCEPT" if action == "allow" else "DROP"
+                        if f"-j {want_target}" not in line:
                             continue
-                        delete_cmds.append("sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1))
-                else:
-                    # Validate port number
-                    try:
-                        port_num = int(port)
-                        if port_num < 1 or port_num > 65535:
-                            print('Invalid port number: {} (must be 1-65535)\n'.format(port))
-                            continue
-                    except ValueError:
-                        print('Invalid port number: {}\n'.format(port))
-                        continue
-                    for line in rule_lines:
-                        if not line.startswith("-A INPUT"):
-                            continue
-                        if "-j ACCEPT" not in line and "-j DROP" not in line:
-                            continue
-                        if any_source:
-                            if "-s " in line and "-s 0.0.0.0/0" not in line:
-                                continue
+                        # source match (any-source equivalence)
+                        if source in ("0.0.0.0/0", "0.0.0.0"):
+                            # accept both: with -s 0.0.0.0/0 OR no -s
+                            pass
                         else:
-                            if "-s {}".format(source) not in line:
+                            if f"-s {source}" not in line:
                                 continue
-                        if "--dport {}".format(port_num) not in line:
-                            continue
-                        if _is_excluded_rule(line):
-                            continue
-                        delete_cmds.append("sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1))
 
-            for del_cmd in delete_cmds:
-                del_proc = subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                del_proc.communicate()
-                if del_proc.returncode == 0:
-                    live_removed_count += 1
+                        del_line = line.replace(f"-A {AELLA_INPUT_CHAIN}", f"-D {AELLA_INPUT_CHAIN}", 1)
+                        self._run_cmd("sudo iptables " + del_line)
+                        live_removed += 1
 
-            # Update staging rules
-            staging = self._load_acl_staging()
-            rules = staging.get("rules", [])
-            new_rules = []
-            for rule in rules:
-                rule_source = rule.get("source")
-                rule_ports = rule.get("ports", [])
-                if rule_source != source:
-                    new_rules.append(rule)
-                    continue
-
-                normalized_ports = [str(p) for p in rule_ports]
-                if "all" in normalized_ports:
-                    staged_removed_count += 1
-                    continue
-                if ports == ['all']:
-                    staged_removed_count += 1
-                    continue
-
-                keep_ports = [p for p in normalized_ports if p not in [str(pv) for pv in ports]]
-                if not keep_ports:
-                    staged_removed_count += 1
-                    continue
-
-                if keep_ports != normalized_ports:
-                    rule["ports"] = keep_ports
-                    staged_removed_count += 1
-                new_rules.append(rule)
-
-            if new_rules != rules:
-                staging["rules"] = new_rules
-                self._save_acl_staging(staging)
-
-            if live_removed_count or staged_removed_count:
-                print('Removed {} live rule(s), removed {} staged rule(s).\n'.format(
-                    live_removed_count, staged_removed_count
-                ))
-                if live_removed_count:
-                    self._ensure_default_accept_policy()
-            else:
-                print('No matching ACL rules found to remove.\n')
-                print('Use "show acl" to see current rules.\n')
-            
-        except Exception as e:
-            print('Failed to unset ACL: {}\n'.format(e))
+        if staged_removed or live_removed:
+            print(f"\nRemoved {live_removed} live rule(s), removed {staged_removed} staged rule(s).\n")
+        else:
+            print("\nNo matching ACL rules found to remove.\n")
+            print('Use "show acl" to see current rules.\n')
 
     def unset_interface_callback(self, key, param):
         if self.is_sensor_host_mode():
@@ -3034,6 +4064,8 @@ class AellaCli(cmd.Cmd, object):
     def complete_unset(self, text, line, begidx, endidx):
         if not text:
             completions = self.unset_command_help.keys()
+        elif line.startswith('unset interface'):
+            return self.complete_unset_interface(text, line, begidx, endidx)
         else:
             completions = [f for f in self.unset_command_help.keys() if f.startswith(text)]
         return completions
@@ -3944,6 +4976,29 @@ class AellaCli(cmd.Cmd, object):
                 return f.readlines()
         return []
 
+    def _interface_block_exists(self, interface):
+        main_path = "/etc/network/interfaces"
+        if not os.path.exists(main_path):
+            return False
+        try:
+            with open(main_path, 'r') as f:
+                for line in f:
+                    if re.match(r'^\s*(auto|iface|allow-hotplug)\s+{}\b'.format(re.escape(interface)), line):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _resolve_iface_config_name(self, interface):
+        if not self.is_sensor_host_mode():
+            return interface
+        if interface == "host":
+            if self._interface_block_exists(interface):
+                return interface
+            if self._interface_block_exists("hostmgmt"):
+                return "hostmgmt"
+        return interface
+
     def _netmask_to_cidr(self, netmask):
         try:
             packed = socket.inet_aton(netmask)
@@ -3953,13 +5008,14 @@ class AellaCli(cmd.Cmd, object):
             return None
 
     def _get_interface_expected_config(self, interface):
-        lines = self._read_interface_config_lines(interface)
+        config_interface = self._resolve_iface_config_name(interface)
+        lines = self._read_interface_config_lines(config_interface)
         in_block = False
         address = None
         netmask = None
         dns_list = []
         for line in lines:
-            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(config_interface)), line):
                 in_block = True
             elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
                 in_block = False
@@ -3985,11 +5041,12 @@ class AellaCli(cmd.Cmd, object):
         return expected_ip, dns_list
 
     def _get_interface_netmask(self, interface):
-        lines = self._read_interface_config_lines(interface)
+        config_interface = self._resolve_iface_config_name(interface)
+        lines = self._read_interface_config_lines(config_interface)
         in_block = False
         netmask = None
         for line in lines:
-            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(config_interface)), line):
                 in_block = True
             elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
                 in_block = False
@@ -3999,6 +5056,23 @@ class AellaCli(cmd.Cmd, object):
             if netmask_match:
                 netmask = netmask_match.group(1)
         return netmask
+
+    def _get_interface_gateway(self, interface):
+        config_interface = self._resolve_iface_config_name(interface)
+        lines = self._read_interface_config_lines(config_interface)
+        in_block = False
+        gateway = None
+        for line in lines:
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(config_interface)), line):
+                in_block = True
+            elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                in_block = False
+            if not in_block:
+                continue
+            gw_match = re.match(r'^\s*gateway\s+(\S+)', line)
+            if gw_match:
+                gateway = gw_match.group(1)
+        return gateway
 
     def _ensure_interfaces_base(self):
         main_path = "/etc/network/interfaces"
@@ -4027,7 +5101,8 @@ class AellaCli(cmd.Cmd, object):
             self._write_interfaces_file_with_backup(contents)
 
     def _parse_iface_block(self, interface):
-        lines = self._read_interface_config_lines(interface)
+        config_interface = self._resolve_iface_config_name(interface)
+        lines = self._read_interface_config_lines(config_interface)
         in_block = False
         mode = None
         address = None
@@ -4035,14 +5110,14 @@ class AellaCli(cmd.Cmd, object):
         dns_list = []
         block_lines = []
         for line in lines:
-            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(config_interface)), line):
                 in_block = True
             elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
                 break
             if not in_block:
                 continue
             block_lines.append(line.rstrip("\n"))
-            iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(interface)), line)
+            iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(config_interface)), line)
             if iface_match:
                 mode = iface_match.group(1)
             addr_match = re.match(r'^\s*address\s+(\S+)', line)
@@ -4075,7 +5150,8 @@ class AellaCli(cmd.Cmd, object):
             return False
 
     def _ensure_iface_stanza(self, interface, expected_ip, expected_dns):
-        mode, address, netmask, dns_list, block_lines = self._parse_iface_block(interface)
+        config_interface = self._resolve_iface_config_name(interface)
+        mode, address, netmask, dns_list, block_lines = self._parse_iface_block(config_interface)
         if mode:
             if mode == "static" and (not address or not netmask):
                 print("Invalid interface stanza for {}: static requires address/netmask".format(interface))
@@ -4094,15 +5170,15 @@ class AellaCli(cmd.Cmd, object):
             return False
 
         new_block = [
-            "auto {}".format(interface),
-            "iface {} inet static".format(interface),
+            "auto {}".format(config_interface),
+            "iface {} inet static".format(config_interface),
             "address {}".format(addr),
             "netmask {}".format(netmask_str),
         ]
         if expected_dns:
             new_block.append("dns-nameservers {}".format(" ".join(expected_dns)))
 
-        lines = self._read_interface_config_lines(interface)
+        lines = self._read_interface_config_lines(config_interface)
         new_lines = [l.rstrip("\n") for l in lines]
         if new_lines and new_lines[-1].strip():
             new_lines.append("")
@@ -4110,7 +5186,8 @@ class AellaCli(cmd.Cmd, object):
         return self._write_interfaces_file_with_backup(new_lines)
 
     def _apply_interface_config(self, interface, ip=None, gateway=None, dns_list=None):
-        lines = self._read_interface_config_lines(interface)
+        config_interface = self._resolve_iface_config_name(interface)
+        lines = self._read_interface_config_lines(config_interface)
         if dns_list is None:
             dns_list = []
 
@@ -4118,7 +5195,7 @@ class AellaCli(cmd.Cmd, object):
         end = None
         in_block = False
         for idx, line in enumerate(lines):
-            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+            if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(config_interface)), line):
                 if start is None:
                     start = idx
                     in_block = True
@@ -4189,8 +5266,8 @@ class AellaCli(cmd.Cmd, object):
 
         new_block = []
         if existing_auto or start is None:
-            new_block.append("auto {}".format(interface))
-        new_block.append("iface {} inet {}".format(interface, mode))
+            new_block.append("auto {}".format(config_interface))
+        new_block.append("iface {} inet {}".format(config_interface, mode))
 
         if mode != "dhcp":
             if new_address:
@@ -4203,22 +5280,77 @@ class AellaCli(cmd.Cmd, object):
             new_block.append("dns-nameservers {}".format(" ".join(new_dns)))
 
         for line in other_lines:
-            if line:
-                new_block.append(line)
+            if not line:
+                continue
+            if re.match(r'^\s*source\s+/etc/network/interfaces\.d/\*', line):
+                continue
+            if re.match(r'^\s*iface\s+lo\s+inet\s+loopback', line):
+                continue
+            if re.match(r'^\s*auto\s+lo\b', line):
+                continue
+            new_block.append(line)
 
-        if start is None:
-            if lines and not lines[-1].endswith("\n"):
-                lines[-1] = lines[-1] + "\n"
-            new_lines = [l.rstrip("\n") for l in lines]
-            if new_lines and new_lines[-1].strip():
-                new_lines.append("")
-            new_lines.extend(new_block)
-        else:
-            new_lines = [l.rstrip("\n") for l in lines[:start]] + new_block + [l.rstrip("\n") for l in lines[end:]]
-
-        if not self.update_interface_file(interface, new_lines):
+        if not self.update_interface_file(config_interface, new_block):
             return False
+        if dns_list:
+            keep_path = self._get_interface_config_target_path(config_interface)
+            self._purge_interface_dns_from_other_files(config_interface, keep_path)
         return True
+
+    def _get_interface_config_target_path(self, interface):
+        main_path = "/etc/network/interfaces"
+        interface_in_main = False
+        if os.path.exists(main_path):
+            try:
+                with open(main_path, 'r') as f:
+                    for line in f:
+                        if re.match(r'^\s*(auto|iface|allow-hotplug)\s+{}\s+'.format(re.escape(interface)), line):
+                            interface_in_main = True
+                            break
+            except Exception:
+                interface_in_main = False
+        if interface == 'data1g' and not interface_in_main:
+            return "/etc/network/interfaces.d/01-data1g.cfg"
+        if interface == 'data10g' and not interface_in_main:
+            return "/etc/network/interfaces.d/10-data10g.cfg"
+        return main_path
+
+    def _purge_interface_dns_from_other_files(self, interface, keep_path):
+        paths = []
+        main_path = "/etc/network/interfaces"
+        if os.path.exists(main_path):
+            paths.append(main_path)
+        interfaces_d_dir = "/etc/network/interfaces.d"
+        if os.path.exists(interfaces_d_dir):
+            for filename in os.listdir(interfaces_d_dir):
+                if filename.endswith('.cfg'):
+                    paths.append(os.path.join(interfaces_d_dir, filename))
+
+        for path in paths:
+            if path == keep_path:
+                continue
+            try:
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            current_interface = None
+            updated = []
+            changed = False
+            for line in lines:
+                iface_match = re.match(r'^\s*(auto|iface|allow-hotplug)\s+(\S+)', line)
+                if iface_match:
+                    current_interface = iface_match.group(2)
+                if current_interface == interface and re.match(r'^\s*dns-nameservers\s+(.+)', line):
+                    changed = True
+                    continue
+                updated.append(line)
+            if changed:
+                try:
+                    with open(path, 'w') as f:
+                        f.writelines(updated)
+                except Exception:
+                    continue
 
     def set_interface_callback2(self, param):
         status = 0
@@ -4523,6 +5655,7 @@ class AellaCli(cmd.Cmd, object):
 
     def _restart_interface_with_verification(self, interface):
         expected_ip, expected_dns = self._get_interface_expected_config(interface)
+        expected_gateway = self._get_interface_gateway(interface)
         self._ensure_interfaces_base()
         if not self._ensure_iface_stanza(interface, expected_ip, expected_dns):
             return False
@@ -4545,8 +5678,71 @@ class AellaCli(cmd.Cmd, object):
 
         if not self.restart_new_network_manager(interface, expected_ip=expected_ip, expected_dns=expected_dns):
             return False
+
+        if expected_gateway and self.is_sensor_host_mode():
+            if not self._ensure_host_gateway(interface, expected_gateway):
+                return False
+
+        if interface == "mgt" and expected_gateway and not self.is_sensor_host_mode():
+            if not self._ensure_mgt_gateway(interface, expected_gateway):
+                return False
+
         print("Restart completed.\n")
         return True
+
+    def _ensure_host_gateway(self, interface, gateway):
+        cmd_show = "ip route show default"
+        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        out, _ = proc.communicate()
+        if out:
+            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
+            if m and m.group(1) == gateway and m.group(2) == interface:
+                return True
+
+        cmd_set = "ip route replace default via {} dev {}".format(gateway, interface)
+        set_proc = subprocess.run(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if set_proc.returncode != 0:
+            err_msg = set_proc.stderr.strip() if set_proc.stderr else set_proc.stdout.strip()
+            err_msg = err_msg if err_msg else "Unknown error"
+            print("Failed to apply host gateway: {}".format(err_msg))
+            return False
+
+        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        out, _ = proc.communicate()
+        if out:
+            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
+            if m and m.group(1) == gateway and m.group(2) == interface:
+                return True
+
+        print("Failed to verify host default gateway")
+        return False
+
+    def _ensure_mgt_gateway(self, interface, gateway):
+        cmd_show = "ip route show table 1 | grep default"
+        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        out, _ = proc.communicate()
+        if out:
+            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
+            if m and m.group(1) == gateway and m.group(2) == interface:
+                return True
+
+        cmd_set = "ip route replace default via {} dev {} table 1".format(gateway, interface)
+        set_proc = subprocess.run(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if set_proc.returncode != 0:
+            err_msg = set_proc.stderr.strip() if set_proc.stderr else set_proc.stdout.strip()
+            err_msg = err_msg if err_msg else "Unknown error"
+            print("Failed to apply management gateway: {}".format(err_msg))
+            return False
+
+        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        out, _ = proc.communicate()
+        if out:
+            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
+            if m and m.group(1) == gateway and m.group(2) == interface:
+                return True
+
+        print("Failed to verify management gateway in table 1")
+        return False
 
     def restart_new_network_manager(self, interface, expected_ip=None, expected_dns=None):
         try:
@@ -4585,8 +5781,8 @@ class AellaCli(cmd.Cmd, object):
             )
             if up_proc.returncode != 0:
                 err_text = "{}\n{}".format(up_proc.stdout or "", up_proc.stderr or "")
-                if expected_ip and "File exists" in err_text:
-                    print("Warning: ifup returned File exists; continuing with state verification")
+                if expected_ip and ("File exists" in err_text or "Address already assigned" in err_text):
+                    print("Warning: ifup returned address already assigned; continuing with state verification")
                 else:
                     print("Failed to restart networking!")
                     print("returncode: {}".format(up_proc.returncode))
@@ -4797,7 +5993,8 @@ class AellaCli(cmd.Cmd, object):
 
         supported_interfaces = ['mgt', 'data1g', 'data10g']
         if interface not in supported_interfaces:
-            print('Invalid interface name: Specify a supported interface name (mgt, data1g, data10g)')
+            # Allow user-selected interfaces without hardcoding
+            self.set_interface_sensor(param)
             return
         # DP Appliance does NOT support dhcp on any interfaces
         #if option == 'dns' and (interface == 'data0'):
@@ -4826,12 +6023,8 @@ class AellaCli(cmd.Cmd, object):
                     print("Invalid ip option: DHCP client is not supported")
                     return
                 if '/' not in parsed["ip"] and self.valid_ipv4_address(parsed["ip"]):
-                    current_netmask = self._get_interface_netmask(interface)
-                    if current_netmask:
-                        parsed["ip"] = "{}/{}".format(parsed["ip"], current_netmask)
-                    else:
-                        print('Please specify network mask: {0}'.format(parsed["ip"]))
-                        return
+                    print('Please specify network mask: {0}'.format(parsed["ip"]))
+                    return
                 if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
                     print('Invalid IP address format: {0}'.format(parsed["ip"]))
                     return
@@ -4870,13 +6063,8 @@ class AellaCli(cmd.Cmd, object):
         if option == 'ip':
             #if ip_address != 'dhcp' and len(ip_address.split('.')) < 4:
             if ip_address != 'dhcp' and '/' not in ip_address and self.valid_ipv4_address(ip_address):
-                current_netmask = self._get_interface_netmask(interface)
-                if current_netmask:
-                    ip_address = "{}/{}".format(ip_address, current_netmask)
-                    param[2] = ip_address
-                else:
-                    print('Please specify network mask: {0}'.format(ip_address))
-                    return
+                print('Please specify network mask: {0}'.format(ip_address))
+                return
             if ip_address != 'dhcp' and not self.valid_ipv4_address(ip_address):
                 print('Invalid IP address format: {0}'.format(ip_address))
                 return
@@ -4947,15 +6135,13 @@ class AellaCli(cmd.Cmd, object):
                 return bool(m) and all(map(lambda n: 0 <= int(n) <= 255, m.groups()))
          
     def complete_set_interface(self, text, line, begidx, endidx):
-        options = ['ip', 'gateway', 'dns']
-        if line.find('en') >= 0 or line.find('eth') >= 0 or \
-           line.find('br0-aio') >= 0 or line.find('mgt') >= 0 or line.find('xmgt') >= 0 or line.find('data') >= 0:
+        options = ['ip', 'gateway', 'dns', 'restart']
+        prefix_tokens = line[:begidx].split()
+        # Expect: set interface <iface> [option]
+        if len(prefix_tokens) >= 3:
             completion_set = options
         else:
-            interfaces = os.listdir('/sys/class/net/')
-            interfaces.remove('virbr0')
-            interfaces.remove('virbr0-nic')
-            completion_set = interfaces
+            completion_set = self._get_interface_completion_list()
 
         if not text:
             completions = completion_set
@@ -4963,14 +6149,65 @@ class AellaCli(cmd.Cmd, object):
             completions = [f for f in completion_set if f.startswith(text)]
         return completions
 
+    def complete_unset_interface(self, text, line, begidx, endidx):
+        options = ['ip', 'gateway', 'restart']
+        prefix_tokens = line[:begidx].split()
+        # Expect: unset interface <iface> [option]
+        if len(prefix_tokens) >= 3:
+            completion_set = options
+        else:
+            completion_set = self._get_interface_completion_list()
+
+        if not text:
+            completions = completion_set
+        else:
+            completions = [f for f in completion_set if f.startswith(text)]
+        return completions
+
+    def complete_show_interface(self, text, line, begidx, endidx):
+        completion_set = self._get_interface_completion_list()
+        if not text:
+            return completion_set
+        return [f for f in completion_set if f.startswith(text)]
+
+    def _get_interface_completion_list(self):
+        interfaces = os.listdir('/sys/class/net/')
+        if 'virbr0' in interfaces:
+            interfaces.remove('virbr0')
+        if 'virbr0-nic' in interfaces:
+            interfaces.remove('virbr0-nic')
+        # Allow CLI aliases even if not kernel interfaces
+        try:
+            if self._interface_block_exists("host") or self._interface_block_exists("hostmgmt"):
+                interfaces.append("host")
+            if self._interface_block_exists("hostmgmt"):
+                interfaces.append("hostmgmt")
+        except Exception:
+            pass
+        return interfaces
+
     def complete_set(self, text, line, begidx, endidx):
         if not text and not line.startswith('set'):
             completions = self.set_command_help.keys()
         elif line.startswith('set interface'):
             return self.complete_set_interface(text, line, begidx, endidx)
+        elif line.startswith('set dns'):
+            return self.complete_set_dns(text, line, begidx, endidx)
         else:
             completions = [f for f in self.set_command_help.keys() if f.startswith(text)]
         return completions
+
+    def complete_set_dns(self, text, line, begidx, endidx):
+        tokens = line.split()
+        # Expect: set dns <iface> [dns...]
+        if len(tokens) <= 2:
+            completion_set = self._get_interface_completion_list()
+        else:
+            # DNS values are free-form IPs; no safe completion
+            completion_set = []
+        if not text:
+            return completion_set
+        return [f for f in completion_set if f.startswith(text)]
 
     def complete_monitor(self, text, line, begidx, endidx):
         """Tab completion for monitor command"""
