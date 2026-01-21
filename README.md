@@ -24,9 +24,10 @@ This CLI tool was developed to perform the following tasks in Stellar Cyber Appl
 #### Interface Information Display and Configuration
 ```bash
 show interface              # Display all network interface information
-set interface <interface> ip <IP> <netmask> [gateway]  # Set IP address
+set interface <interface> ip <IP/Mask> [gateway <IP>] [dns <dns1> ...]  # Set IP address
 set interface <interface> gateway <gateway>            # Set Gateway
 set interface <interface> dns <dns1> [dns2 ...]        # Set DNS servers
+set interface <interface> restart                      # Apply changes (restart iface)
 unset interface <interface>                            # Remove interface configuration
 ```
 
@@ -62,25 +63,32 @@ unset ntp <server>         # Remove NTP server
 
 ### 3. Access Control List (ACL) Management
 
-Firewall rule management using iptables:
+Firewall rule management using iptables (staged, apply required):
 
 ```bash
-show acl                   # Display current iptables INPUT chain rules
-set acl allow <IP/network> <port> [port2 ...] | all [description]  # Allow access from IP/network to port(s)
-set acl deny <IP/network> <port> [port2 ...] | all [description]   # Deny access from IP/network to port(s)
-unset acl <IP/network> <port> [port2 ...] | all                    # Remove rule
+show acl                                      # Display current AELLA-managed rules
+set acl policy                                # Initialize ACL mode and interface
+set acl <IP/network> <port|icmp|ping|all> [description]  # Stage rule
+set acl apply [--reset]                       # Apply staged rules
+unset acl <IP/network> <port|icmp|ping|all>   # Remove rule (staged + live)
 ```
 
 **Examples:**
 ```bash
+# Initialize policy (select whitelist/blacklist + interface)
+set acl policy
+
 # Allow access to port 22 from single IP
-set acl allow 192.168.1.100 22 "Admin SSH access"
+set acl 192.168.1.100 22 "Admin SSH access"
 
 # Allow access to multiple ports from network
-set acl allow 192.168.1.0/24 80 443 "Web servers"
+set acl 192.168.1.0/24 80 443 "Web servers"
 
-# Allow access to all ports from network
-set acl allow 10.0.0.0/8 all "Internal network"
+# Allow ICMP ping
+set acl 192.168.1.10 icmp "Ping allowed"
+
+# Apply staged rules
+set acl apply
 
 # Remove rule
 unset acl 192.168.1.100 22
@@ -88,14 +96,15 @@ unset acl 192.168.1.100 22
 
 **Features:**
 - Controls access **from** source IP addresses or CIDR networks (e.g., `192.168.1.0/24`) **to** destination ports
-- Supports single port, multiple ports, or all ports
+- Supports single port, multiple ports, icmp/ping, or all
 - Optional description/comment for each rule
-- View rules with descriptions using `show acl` command
-- Local interface IPs (e.g., 192.168.0.100) are always allowed and cannot be blocked
-- Default policy is ACCEPT when no user-defined ACL rules are configured
+- `set acl apply` is required to activate staged rules
+- `set acl apply --reset` rebuilds rules from staging
+- `show acl` displays AELLA-managed chain entries in order
+- Local interface IPs (e.g., 127.0.0.1, 192.168.0.100, 192.168.122.1) are always allowed and cannot be blocked
 - Local interface IP rules are hidden from `show acl` output and cannot be removed using `unset acl`
 
-**Note:** ACL rules control incoming traffic. For example, `set acl allow 192.168.1.100 22` allows access **from** 192.168.1.100 **to** port 22 on this KVM host.
+**Note:** ACL rules control incoming traffic. For example, `set acl 192.168.1.100 22` allows access **from** 192.168.1.100 **to** port 22 on this KVM host after `set acl apply`.
 
 ### 4. System Information Display
 
@@ -269,14 +278,14 @@ set <item> ?            # Show usage for set command (e.g., set interface ?)
 # Display all network interfaces
 Appliance> show interface
 
-# Configure IP address for an interface
-Appliance> set interface mgmt ip 192.168.1.100 255.255.255.0 192.168.1.1
+# Configure IP address for an interface (IP/Mask required)
+Appliance> set interface mgt ip 192.168.1.100/24 gateway 192.168.1.1 dns 8.8.8.8 8.8.4.4
 
 # Set DNS servers for an interface
-Appliance> set interface mgmt dns 8.8.8.8 8.8.4.4
+Appliance> set interface mgt dns 8.8.8.8 8.8.4.4
 
 # Restart interface to apply changes
-Appliance> set interface mgmt restart
+Appliance> set interface mgt restart
 
 # Display DNS configuration
 Appliance> show dns
@@ -304,14 +313,17 @@ Appliance> unset ntp pool.ntp.org
 # Display current ACL rules
 Appliance> show acl
 
+# Initialize ACL policy (select mode + interface)
+Appliance> set acl policy
+
 # Allow SSH access from specific IP
-Appliance> set acl allow 192.168.1.100 22 "Admin SSH"
+Appliance> set acl 192.168.1.100 22 "Admin SSH"
 
-# Allow multiple ports from network
-Appliance> set acl allow 192.168.1.0/24 80 443 "Web access"
+# Allow ICMP ping from specific IP
+Appliance> set acl 192.168.1.10 icmp "Ping"
 
-# Deny access from IP
-Appliance> set acl deny 10.0.0.50 22 "Blocked IP"
+# Apply staged rules
+Appliance> set acl apply
 
 # Remove ACL rule
 Appliance> unset acl 192.168.1.100 22
@@ -434,15 +446,16 @@ The CLI can automatically:
 
 ### Firewall (ACL) Rules
 
-- **Immediate Application**: ACL rules are applied immediately to iptables
+- **Staged Application**: Rules are staged by `set acl` and applied only by `set acl apply`
+- **Reset Apply**: `set acl apply --reset` rebuilds the chain from staging
 - **Persistence**: To make rules persistent across reboots, save iptables rules:
   ```bash
   sudo iptables-save > /etc/iptables/rules.v4
   # Or for Ubuntu:
   sudo netfilter-persistent save
   ```
-- **Default Policy**: When no user-defined ACL rules are configured, the default policy is ACCEPT (all traffic allowed)
-- **Local Interface IPs**: Local interface IPs (e.g., 192.168.0.100) are:
+- **Default Policy**: Policy mode is set by `set acl policy` (whitelist/blacklist). No rules are active until you apply staging.
+- **Local Interface IPs**: Local interface IPs (e.g., 127.0.0.1, 192.168.0.100, 192.168.122.1) are:
   - Always allowed regardless of ACL deny rules
   - Hidden from `show acl` output
   - Cannot be removed using `unset acl`
