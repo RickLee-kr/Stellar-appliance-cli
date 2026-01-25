@@ -2,171 +2,31 @@
 
 A command-line interface (CLI) tool for Stellar Cyber Appliance. It allows you to manage network settings, NTP configuration, firewall rules, and more on KVM hosts running OpenXDR Data Processor and Sensor components.
 
+## Table of Contents
+
+- Overview
+- Installation
+- Usage
+- Command Summary
+- ACL Workflow
+- Supported Installer Scripts
+- Important Notes
+- File Structure
+- Troubleshooting
+- License
+- Contributing
+- Related Projects
+
 ## Overview
 
-The Stellar Appliance CLI provides a unified interface for managing KVM hosts deployed using the OpenXDR KVM Installer scripts. It automatically recognizes and manages configurations set by the installer scripts, making it easy to maintain and configure your OpenXDR deployment.
+The Stellar Appliance CLI provides a unified interface for managing KVM hosts deployed using the OpenXDR KVM Installer scripts. It automatically recognizes and manages configurations set by the installer scripts.
 
-## Purpose
-
-This CLI tool was developed to perform the following tasks in Stellar Cyber Appliance environments:
-
-- **Network Configuration Management**: IP address, Gateway, and DNS server configuration
-- **NTP Configuration Management**: Support for various NTP implementations (ntpsec, chrony, systemd-timesyncd)
-- **Firewall Rule Management**: Access Control List (ACL) management using iptables
-- **System Information Query**: Hostname, service status, routing tables, VM status, etc.
-- **System Configuration**: Timezone, time, patch management, VM auto-start, etc.
-- **VM Management**: Monitor VM resources, access VM consoles, manage VM auto-start
-
-## Key Features
-
-### 1. Network Configuration Management
-
-#### Interface Information Display and Configuration
-```bash
-show interface              # Display all network interface information
-set interface <interface> ip <IP/Mask> [gateway <IP>] [dns <dns1> ...]  # Set IP address
-set interface <interface> gateway <gateway>            # Set Gateway
-set interface <interface> dns <dns1> [dns2 ...]        # Set DNS servers
-set interface <interface> restart                      # Apply changes (restart iface)
-unset interface <interface>                            # Remove interface configuration
-```
-
-#### DNS Server Display and Configuration
-```bash
-show dns                   # Display currently configured DNS servers
-set dns <interface> <dns1> [dns2 ...]  # Set DNS servers
-```
-
-#### Gateway Display
-```bash
-show gateway               # Display default Gateway information
-```
-
-### 2. NTP Configuration Management
-
-Automatically detects and supports various NTP implementations:
-- **ntpsec**: `/etc/ntpsec/ntp.conf`
-- **chrony**: `/etc/chrony/chrony.conf`
-- **systemd-timesyncd**: `/etc/systemd/timesyncd.conf`
-- **legacy ntp**: `/etc/ntp.conf`
-
-```bash
-show ntp                   # Display current NTP configuration and server information
-set ntp <server>           # Add NTP server
-unset ntp <server>         # Remove NTP server
-```
-
-**Features:**
-- Automatically recognizes NTP configurations set by installer scripts
-- Automatically detects active NTP service
-- Automatically restarts NTP service
-
-### 3. Access Control List (ACL) Management
-
-Firewall rule management using iptables (staged, apply required):
-
-```bash
-show acl                                      # Display current AELLA-managed rules
-set acl policy                                # Initialize ACL mode and interface
-set acl <IP/network> <port|icmp|ping|all> [description]  # Stage rule
-set acl apply [--reset]                       # Apply staged rules
-unset acl <IP/network> <port|icmp|ping|all>   # Remove rule (staged + live)
-```
-
-**Examples:**
-```bash
-# Initialize policy (select whitelist/blacklist + interface)
-set acl policy
-
-# Allow access to port 22 from single IP
-set acl 192.168.1.100 22 "Admin SSH access"
-
-# Allow access to multiple ports from network
-set acl 192.168.1.0/24 80 443 "Web servers"
-
-# Allow ICMP ping
-set acl 192.168.1.10 icmp "Ping allowed"
-
-# Apply staged rules
-set acl apply
-
-# Remove rule
-unset acl 192.168.1.100 22
-```
-
-**Features:**
-- Controls access **from** source IP addresses or CIDR networks (e.g., `192.168.1.0/24`) **to** destination ports
-- Supports single port, multiple ports, icmp/ping, or all
-- Optional description/comment for each rule
-- `set acl apply` is required to activate staged rules
-- `set acl apply --reset` rebuilds rules from staging
-- `show acl` displays AELLA-managed chain entries in order
-- Local interface IPs (e.g., 127.0.0.1, 192.168.0.100, 192.168.122.1) are always allowed and cannot be blocked
-- Local interface IP rules are hidden from `show acl` output and cannot be removed using `unset acl`
-
-**Note:** ACL rules control incoming traffic. For example, `set acl 192.168.1.100 22` allows access **from** 192.168.1.100 **to** port 22 on this KVM host after `set acl apply`.
-
-### 4. System Information Display
-
-```bash
-show version               # Display system information
-show hostname              # Display hostname
-show service               # Display service status
-show timezone              # Display timezone information
-show time                  # Display system time
-show route                 # Display routing table
-```
-
-### 5. System Configuration
-
-```bash
-set timezone <timezone>    # Set timezone
-set time <YYYY-MM-DD HH:MM:SS>  # Set system time
-set hostname <hostname>    # Set hostname
-set password               # Change administrator password
-```
-
-### 6. Service Management
-
-```bash
-start <service>            # Start service
-restart <service>         # Restart service
-shutdown <service>         # Shutdown service
-```
-
-### 7. VM Management
-
-```bash
-console <vm>               # Jump to VM console (dl-master, da-master, mds, aio, sensor)
-show autostart             # Display VM auto-start configuration
-set autostart <vm> <on|off>  # Configure VM auto-start
-monitor                    # Monitor VM resources and system status
-```
-
-**Supported VMs:**
-- `dl-master`: Data Lake master VM
-- `da-master` or `dr-master`: Data Analytics master VM
-- `mds`: Metadata Server VM
-- `aio`: All-In-One Data Processor VM
-- `sensor`: Sensor VM
-
-### 8. Patch Management
-
-```bash
-show patch_history         # Display patch application history
-set patches <patch_file>   # Apply patches/updates
-set patch <patch_file>     # Alias for set patches
-```
-
-### 9. CLI Utilities
-
-```bash
-show cli                   # Show CLI command history
-clear                     # Clear command history
-help                      # Display help information
-help <command>            # Show help for specific command
-quit                      # Exit CLI
-```
+Key areas covered:
+- Network configuration (IP/Mask required, DNS on `mgt` only)
+- NTP configuration (ntpsec, chrony, systemd-timesyncd, legacy ntp)
+- ACL management with staged rules and ICMP support
+- System information/configuration and service control
+- VM console and autostart control, patch management
 
 ## Installation
 
@@ -270,134 +130,6 @@ show <item> ?           # Show usage for specific item (e.g., show interface ?)
 set <item> ?            # Show usage for set command (e.g., set interface ?)
 ```
 
-### Usage Examples
-
-#### Network Configuration
-
-```bash
-# Display all network interfaces
-Appliance> show interface
-
-# Configure IP address for an interface (IP/Mask required)
-Appliance> set interface mgt ip 192.168.1.100/24 gateway 192.168.1.1 dns 8.8.8.8 8.8.4.4
-
-# Set DNS servers for an interface
-Appliance> set interface mgt dns 8.8.8.8 8.8.4.4
-
-# Restart interface to apply changes
-Appliance> set interface mgt restart
-
-# Display DNS configuration
-Appliance> show dns
-
-# Display gateway information
-Appliance> show gateway
-```
-
-#### NTP Configuration
-
-```bash
-# Display current NTP configuration
-Appliance> show ntp
-
-# Add NTP server
-Appliance> set ntp pool.ntp.org
-
-# Remove NTP server
-Appliance> unset ntp pool.ntp.org
-```
-
-#### Firewall (ACL) Management
-
-```bash
-# Display current ACL rules
-Appliance> show acl
-
-# Initialize ACL policy (select mode + interface)
-Appliance> set acl policy
-
-# Allow SSH access from specific IP
-Appliance> set acl 192.168.1.100 22 "Admin SSH"
-
-# Allow ICMP ping from specific IP
-Appliance> set acl 192.168.1.10 icmp "Ping"
-
-# Apply staged rules
-Appliance> set acl apply
-
-# Remove ACL rule
-Appliance> unset acl 192.168.1.100 22
-```
-
-#### System Information
-
-```bash
-# Display system version information
-Appliance> show version
-
-# Display hostname
-Appliance> show hostname
-
-# Display service status
-Appliance> show service
-
-# Display routing table
-Appliance> show route
-
-# Display timezone
-Appliance> show timezone
-
-# Display system time
-Appliance> show time
-```
-
-#### System Configuration
-
-```bash
-# Set timezone
-Appliance> set timezone Asia/Seoul
-
-# Set system time
-Appliance> set time 2026-01-15 14:30:00
-
-# Set hostname
-Appliance> set hostname my-appliance
-
-# Change administrator password
-Appliance> set password
-```
-
-#### VM Management
-
-```bash
-# Access VM console
-Appliance> console dl-master
-Appliance> console aio
-Appliance> console sensor
-
-# Display VM auto-start configuration
-Appliance> show autostart
-
-# Enable VM auto-start
-Appliance> set autostart dl-master on
-
-# Disable VM auto-start
-Appliance> set autostart dl-master off
-
-# Monitor VM resources and system status
-Appliance> monitor
-```
-
-#### Patch Management
-
-```bash
-# Display patch history
-Appliance> show patch_history
-
-# Apply patch
-Appliance> set patches /path/to/patch.tar.gz
-```
-
 ### Tab Completion
 
 The CLI supports tab completion for commands and parameters. Press `TAB` to auto-complete:
@@ -405,6 +137,76 @@ The CLI supports tab completion for commands and parameters. Press `TAB` to auto
 - VM names (dl-master, da-master, aio, sensor, etc.)
 - Interface names
 - Other parameters
+
+## Command Summary
+
+### Network
+```bash
+show interface
+set interface <interface> ip <IP/Mask> [gateway <IP>]
+set interface <interface> gateway <IP>
+set interface mgt dns <dns1> [dns2 ...]
+set interface <interface> restart
+unset interface <interface> <ip|gateway|restart>
+show dns
+set dns <interface> <dns1> [dns2 ...]
+show gateway
+```
+
+### NTP
+```bash
+show ntp
+set ntp <server>
+unset ntp <server>
+```
+
+### ACL
+```bash
+show acl
+set acl policy
+set acl <IP/network> <port|icmp|ping|all> [description]
+set acl apply [--reset]
+unset acl <IP/network> <port|icmp|ping> [...] | all
+```
+
+### System and Services
+```bash
+show version|hostname|service|timezone|time|route
+set timezone <timezone>
+set time <YYYY-MM-DD HH:MM:SS>
+set hostname <hostname>
+set password
+start <service>
+restart <service>
+shutdown <service>
+```
+
+### VM and Patch
+```bash
+console <vm>
+show autostart
+set autostart <vm> [enable|disable]
+monitor
+show patch_history
+set patches <patch_file>
+```
+
+## ACL Workflow
+
+1. Initialize policy and target interface:
+   `set acl policy`
+2. Stage rules (ports, `icmp`/`ping`, or `all`):
+   `set acl <IP/network> <port|icmp|ping|all> [description]`
+3. Apply staged rules:
+   `set acl apply` (or `set acl apply --reset`)
+4. Review:
+   `show acl`
+5. Remove rules:
+   `unset acl <IP/network> <port|icmp|ping> [...] | all`
+
+Notes:
+- Rule action follows policy mode: whitelist = allow, blacklist = deny
+- Local interface IPs are always allowed and cannot be blocked
 
 ## Supported Installer Scripts
 
@@ -584,4 +386,4 @@ Please submit issue reports or feature suggestions through GitHub Issues.
 
 ## Related Projects
 
-- [OpenXDR KVM Installer](../OpenXDR%20KVM%20Installer/): KVM host installation scripts for deploying OpenXDR components
+- [OpenXDR KVM Installer](https://kvm.xdr.ooo): KVM host installation scripts for deploying OpenXDR components
