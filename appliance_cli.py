@@ -32,6 +32,7 @@ except Exception:
 import socket
 import signal
 import subprocess
+import shutil
 import struct
 import hashlib
 import logging
@@ -3365,6 +3366,47 @@ class AellaCli(cmd.Cmd, object):
         """Clear staged ACL rules"""
         self._save_acl_staging({"rules": []})
 
+    def _persist_iptables_rules(self) -> bool:
+        """Persist current iptables rules so they survive reboot.
+
+        Preferred: netfilter-persistent save
+        Fallback : iptables-save > /etc/iptables/rules.v4
+        """
+        try:
+            # 1) Preferred path (Ubuntu standard)
+            if shutil.which("netfilter-persistent"):
+                p = subprocess.run(
+                    ["sudo", "netfilter-persistent", "save"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if p.returncode == 0:
+                    return True
+                warn = (p.stderr or p.stdout or "").strip()
+                print(f"[WARN] netfilter-persistent save failed: {warn}")
+
+            # 2) Fallback path
+            if shutil.which("iptables-save"):
+                p = subprocess.run(
+                    ["sudo", "sh", "-c", "iptables-save > /etc/iptables/rules.v4"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if p.returncode == 0:
+                    return True
+                warn = (p.stderr or p.stdout or "").strip()
+                print(f"[WARN] iptables-save fallback failed: {warn}")
+
+            print("[WARN] Unable to persist iptables rules (netfilter-persistent/iptables-save not found).")
+            return False
+        except Exception as e:
+            print(f"[WARN] Persist iptables rules failed: {e}")
+            return False
+
     def _stage_rule(self, action, source, ports, desc):
         """Stage a rule in ACL staging file, avoid duplicates"""
         data = self._load_acl_staging()
@@ -3663,6 +3705,7 @@ class AellaCli(cmd.Cmd, object):
 
             # clear staging after successful apply
             self._clear_acl_staging()
+            self._persist_iptables_rules()
             if reset:
                 print("\nApplied staged ACL rules with reset (rebuild completed).")
             else:
@@ -3979,6 +4022,8 @@ class AellaCli(cmd.Cmd, object):
                         live_removed += 1
 
         if staged_removed or live_removed:
+            if live_removed > 0:
+                self._persist_iptables_rules()
             print(f"\nRemoved {live_removed} live rule(s), removed {staged_removed} staged rule(s).\n")
         else:
             print("\nNo matching ACL rules found to remove.\n")
