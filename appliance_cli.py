@@ -3373,6 +3373,30 @@ class AellaCli(cmd.Cmd, object):
         Fallback : iptables-save > /etc/iptables/rules.v4
         """
         try:
+            # 0) Persist ipset (required before iptables-restore on boot)
+            if shutil.which("ipset"):
+                p = subprocess.run(
+                    ["sudo", "sh", "-c", "ipset save > /etc/ipset.conf"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if p.returncode != 0:
+                    warn = (p.stderr or p.stdout or "").strip()
+                    print(f"[WARN] ipset save failed: {warn}")
+                if shutil.which("systemctl"):
+                    svc = subprocess.run(
+                        ["sudo", "systemctl", "enable", "--now", "ipset-persistent"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    if svc.returncode != 0:
+                        warn = (svc.stderr or svc.stdout or "").strip()
+                        print(f"[WARN] ipset-persistent service enable failed: {warn}")
+
             # 1) Preferred path (Ubuntu standard)
             if shutil.which("netfilter-persistent"):
                 p = subprocess.run(
