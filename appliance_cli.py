@@ -773,9 +773,28 @@ class AellaCli(cmd.Cmd, object):
         with open(timesyncd_conf, 'w') as f:
             f.write(content)
 
+    _NTPSEC_BLOCK_BEGIN_TAGS = frozenset({
+        "# === XDR_NTPSEC_CONFIG_BEGIN ===",
+        "# XDR_NTPSEC_CONFIG_BEGIN",
+    })
+    _NTPSEC_BLOCK_END_TAGS = frozenset({
+        "# === XDR_NTPSEC_CONFIG_END ===",
+        "# XDR_NTPSEC_CONFIG_END",
+    })
+
+    @staticmethod
+    def _strip_ntp_conf_line(line):
+        return line.replace('\r', '').strip()
+
+    @classmethod
+    def _is_ntpsec_block_begin(cls, line):
+        return cls._strip_ntp_conf_line(line) in cls._NTPSEC_BLOCK_BEGIN_TAGS
+
+    @classmethod
+    def _is_ntpsec_block_end(cls, line):
+        return cls._strip_ntp_conf_line(line) in cls._NTPSEC_BLOCK_END_TAGS
+
     def _read_ntpsec_block(self, ntpsec_conf):
-        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
-        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
         servers = []
         lines = []
         if not os.path.exists(ntpsec_conf):
@@ -789,10 +808,10 @@ class AellaCli(cmd.Cmd, object):
         start_idx = None
         end_idx = None
         for idx, line in enumerate(lines):
-            if line.strip() == begin_tag:
+            if self._is_ntpsec_block_begin(line):
                 start_idx = idx
                 continue
-            if line.strip() == end_tag:
+            if self._is_ntpsec_block_end(line):
                 end_idx = idx
                 break
 
@@ -800,7 +819,7 @@ class AellaCli(cmd.Cmd, object):
             return servers, start_idx, end_idx, lines
 
         for line in lines[start_idx + 1:end_idx]:
-            line_stripped = line.strip()
+            line_stripped = self._strip_ntp_conf_line(line)
             if not line_stripped or line_stripped.startswith('#'):
                 continue
             match = re.match(r"^server\s+(\S+)", line_stripped)
@@ -809,8 +828,6 @@ class AellaCli(cmd.Cmd, object):
         return servers, start_idx, end_idx, lines
 
     def _read_ntpsec_block_entries(self, ntpsec_conf):
-        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
-        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
         entries = []
         if not os.path.exists(ntpsec_conf):
             return entries
@@ -823,10 +840,10 @@ class AellaCli(cmd.Cmd, object):
         start_idx = None
         end_idx = None
         for idx, line in enumerate(lines):
-            if line.strip() == begin_tag:
+            if self._is_ntpsec_block_begin(line):
                 start_idx = idx
                 continue
-            if line.strip() == end_tag:
+            if self._is_ntpsec_block_end(line):
                 end_idx = idx
                 break
 
@@ -834,7 +851,7 @@ class AellaCli(cmd.Cmd, object):
             return entries
 
         for line in lines[start_idx + 1:end_idx]:
-            line_stripped = line.strip()
+            line_stripped = self._strip_ntp_conf_line(line)
             if not line_stripped or line_stripped.startswith('#'):
                 continue
             match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
@@ -854,7 +871,7 @@ class AellaCli(cmd.Cmd, object):
 
         seen = set()
         for line in lines:
-            line_stripped = line.strip()
+            line_stripped = self._strip_ntp_conf_line(line)
             if not line_stripped or line_stripped.startswith('#'):
                 continue
             match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
@@ -866,15 +883,13 @@ class AellaCli(cmd.Cmd, object):
         return entries
 
     def _normalize_ntp_target(self, target_raw):
-        target = target_raw.strip()
+        target = target_raw.strip().replace('\r', '')
         match = re.match(r"^(server|pool)\s+(.+)$", target, re.IGNORECASE)
         if match:
             target = match.group(2).strip()
         return target
 
     def _remove_ntpsec_block_target(self, ntpsec_conf, target):
-        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
-        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
         if not os.path.exists(ntpsec_conf):
             return False
         try:
@@ -886,10 +901,10 @@ class AellaCli(cmd.Cmd, object):
         start_idx = None
         end_idx = None
         for idx, line in enumerate(lines):
-            if line.strip() == begin_tag:
+            if self._is_ntpsec_block_begin(line):
                 start_idx = idx
                 continue
-            if line.strip() == end_tag:
+            if self._is_ntpsec_block_end(line):
                 end_idx = idx
                 break
 
@@ -899,7 +914,7 @@ class AellaCli(cmd.Cmd, object):
         removed = False
         new_block_lines = []
         for line in lines[start_idx + 1:end_idx]:
-            line_stripped = line.strip()
+            line_stripped = self._strip_ntp_conf_line(line)
             if not line_stripped or line_stripped.startswith('#'):
                 new_block_lines.append(line)
                 continue
@@ -929,7 +944,7 @@ class AellaCli(cmd.Cmd, object):
         removed = False
         new_lines = []
         for line in lines:
-            line_stripped = line.strip()
+            line_stripped = self._strip_ntp_conf_line(line)
             if not line_stripped or line_stripped.startswith('#'):
                 new_lines.append(line)
                 continue
