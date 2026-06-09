@@ -39,6 +39,7 @@ import logging
 import logging.handlers
 import ipaddress
 import shlex
+import termios
 
 # Timezone constants
 try:
@@ -629,10 +630,55 @@ class AellaCli(cmd.Cmd, object):
             self.shell_cmd_exec('virsh shutdown {}'.format(vm_name))
         return callback
 
+    def _reset_console_terminal(self, saved_attrs=None):
+        fd = sys.stdin.fileno()
+        if saved_attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved_attrs)
+            except (termios.error, OSError, ValueError):
+                pass
+        try:
+            with open("/dev/tty", "r") as tty:
+                subprocess.call(["stty", "sane"], stdin=tty, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def _attach_vm_console(self, vm_name):
+        """Attach to a VM serial/virtio console with proper TTY handoff."""
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print("\nConsole requires an interactive terminal.\n")
+            return
+
+        state = run_cmd(["virsh", "domstate", vm_name], check=False).stdout.strip()
+        if state != "running":
+            print("\nVM {} is not running (state: {}).\n".format(vm_name, state or "unknown"))
+            return
+
+        fd = sys.stdin.fileno()
+        saved_attrs = None
+        try:
+            saved_attrs = termios.tcgetattr(fd)
+        except (termios.error, OSError, ValueError):
+            pass
+
+        self._reset_console_terminal(saved_attrs)
+        print("\nConnecting to {} console (Escape character is ^] )...\n".format(vm_name))
+        rc = subprocess.call(["virsh", "console", "--force", vm_name])
+        self._reset_console_terminal(saved_attrs)
+
+        if rc != 0:
+            print(
+                "\nConsole disconnected from {}.\n"
+                "This is normal if the guest rebooted or closed the console during bootstrap.\n"
+                "Reconnect with: console {}\n".format(vm_name, vm_name)
+            )
+        else:
+            print("")
+
     def _create_vm_console_callback(self, vm_name):
         """Create a callback function for console access to a VM"""
         def callback(key, param):
-            subprocess.call('virsh console --force {}'.format(vm_name), shell=True)
+            self._attach_vm_console(vm_name)
         return callback
 
     def complete_start(self, text, line, begidx, endidx):
