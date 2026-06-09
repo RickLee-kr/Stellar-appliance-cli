@@ -1553,13 +1553,17 @@ class AellaCli(cmd.Cmd, object):
             print('DNS must be set together with IP address on host interface\n')
             print('Example: set interface {0} ip <IP/Mask> dns <DNS1> [DNS2 ...]\n'.format(interface))
             return
-            for d in param[2:]:
-                if not self.valid_ipv4_address(d):
-                    print('Invalid DNS server IP address format: {0}\n'.format(d))
-                    return
 
-        # Delegate to the existing interface-file editor
-        self.set_interface_callback2([interface] + param[1:])
+        if option == 'ip':
+            if not self._apply_interface_config(interface, ip=param[2]):
+                return
+        elif option == 'gateway':
+            if not self._apply_interface_config(interface, gateway=param[2]):
+                return
+        else:
+            return
+
+        print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
 
     def unset_interface_sensor(self, param):
         """Unset host interface configuration for Sensor host (uses /etc/network/interfaces)."""
@@ -1592,9 +1596,12 @@ class AellaCli(cmd.Cmd, object):
             return
 
         # Use existing unset logic but without DP-only restrictions by temporarily bypassing checks
-        # Implement a small local edit on /etc/network/interfaces
+        # Edit the on-disk interface stanza (main file or interfaces.d/*.cfg)
         try:
-            conf_path = '/etc/network/interfaces'
+            config_interface = self._resolve_iface_config_name(interface)
+            conf_path = self._find_iface_config_path(config_interface)
+            if not conf_path:
+                conf_path = self._default_iface_config_path(config_interface)
             if not os.path.exists(conf_path):
                 print('Could not find {}'.format(conf_path))
                 return
@@ -1604,7 +1611,7 @@ class AellaCli(cmd.Cmd, object):
             out = []
             in_block = False
             for line in lines:
-                if re.match(r'^\s*iface\s+{}\s+'.format(re.escape(interface)), line):
+                if re.match(r'^\s*iface\s+{}\s+'.format(re.escape(config_interface)), line):
                     in_block = True
                     out.append(line)
                     continue
@@ -1626,8 +1633,8 @@ class AellaCli(cmd.Cmd, object):
                         continue
                 out.append(line)
 
-            with open(conf_path, 'w') as f:
-                f.writelines(out)
+            if not self._write_iface_config_file_with_backup(conf_path, out):
+                return
 
             print("Run 'unset interface {0} restart' command to apply the changes.\n".format(interface))
         except Exception as e:
@@ -4869,7 +4876,7 @@ class AellaCli(cmd.Cmd, object):
     def update_interface_file(self, interface, contents):
         """Update interface configuration file block only.
         For DP appliances: mgt in /etc/network/interfaces, data1g/data10g in interfaces.d/
-        For Sensor/AIO installers: all interfaces in /etc/network/interfaces
+        For Sensor/KVM installers: mgt/host/hostmgmt in /etc/network/interfaces.d/*.cfg
         """
         try:
             for line in contents:
@@ -4879,56 +4886,45 @@ class AellaCli(cmd.Cmd, object):
                 if re.match(r'^\s*iface\s+lo\s+inet\s+loopback', line):
                     print("Invalid interface block contents: contains loopback stanza")
                     return False
-            # Check if interface is in /etc/network/interfaces (Sensor/AIO installer format)
-            interface_in_main = False
-            if os.path.exists("/etc/network/interfaces"):
-                with open("/etc/network/interfaces", 'r') as f:
-                    for line in f:
-                        if re.match(r'^\s*(auto|iface)\s+{}\s+'.format(re.escape(interface)), line):
-                            interface_in_main = True
-                            break
-            
-            # DP appliance format: data1g/data10g in interfaces.d/
-            if interface == 'data1g' and not interface_in_main:
-                with open("/etc/network/interfaces.d/01-data1g.cfg", 'w') as f:
-                    new_content = "\n".join(contents)
-                    f.write(new_content)
-                return True
-            elif interface == 'data10g' and not interface_in_main:
-                with open("/etc/network/interfaces.d/10-data10g.cfg", 'w') as f:
-                    new_content = "\n".join(contents)
-                    f.write(new_content)
-                return True
+
+            new_block = [line.rstrip("\n") for line in contents]
+            cfg_path = self._find_iface_config_path(interface)
+            main_path = "/etc/network/interfaces"
+
+            if cfg_path and cfg_path != main_path:
+                return self._write_iface_config_file_with_backup(cfg_path, new_block)
+
+            if os.path.exists(main_path):
+                with open(main_path, 'r') as f:
+                    existing = f.read().splitlines()
             else:
-                # mgt or any interface in main file (Sensor/AIO installer format)
-                main_path = "/etc/network/interfaces"
-                if os.path.exists(main_path):
-                    with open(main_path, 'r') as f:
-                        existing = f.read().splitlines()
-                else:
-                    existing = []
+                existing = []
 
-                new_block = [line.rstrip("\n") for line in contents]
-                start = None
-                end = None
-                in_block = False
-                for idx, line in enumerate(existing):
-                    if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
-                        if start is None:
-                            start = idx
-                            in_block = True
-                    elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
-                        end = idx
-                        in_block = False
-                        break
-                if start is not None and end is None:
-                    end = len(existing)
-                if start is None:
-                    updated = existing + ([""] if existing and existing[-1].strip() else []) + new_block
-                else:
-                    updated = existing[:start] + new_block + existing[end:]
+            start = None
+            end = None
+            in_block = False
+            for idx, line in enumerate(existing):
+                if re.match(r'^\s*(auto|iface)\s+{}\b'.format(re.escape(interface)), line):
+                    if start is None:
+                        start = idx
+                        in_block = True
+                elif in_block and re.match(r'^\s*(auto|iface)\s+\S+', line):
+                    end = idx
+                    in_block = False
+                    break
+            if start is not None and end is None:
+                end = len(existing)
 
-                return self._write_interfaces_file_with_backup(updated)
+            if start is None:
+                if self._uses_interfaces_d_source() and interface in self._SENSOR_IFACE_CFG_HINTS:
+                    target = self._default_iface_config_path(interface)
+                    if target != main_path:
+                        return self._write_iface_config_file_with_backup(target, new_block)
+                updated = existing + ([""] if existing and existing[-1].strip() else []) + new_block
+            else:
+                updated = existing[:start] + new_block + existing[end:]
+
+            return self._write_interfaces_file_with_backup(updated)
         except Exception as e:
             print('Failed to update interface configuration')
             print(e)
@@ -5025,38 +5021,99 @@ class AellaCli(cmd.Cmd, object):
                 parsed["dns"] = dns_list
         return parsed
 
-    def _read_interface_config_lines(self, interface):
-        interface_in_main = False
-        main_path = "/etc/network/interfaces"
-        if os.path.exists(main_path):
-            with open(main_path, 'r') as f:
-                for line in f:
-                    if re.match(r'^\s*(auto|iface)\s+{}\s+'.format(re.escape(interface)), line):
-                        interface_in_main = True
-                        break
-        if interface in ("data1g", "data10g") and not interface_in_main:
-            candidate = "/etc/network/interfaces.d/01-data1g.cfg" if interface == "data1g" else "/etc/network/interfaces.d/10-data10g.cfg"
-            if os.path.exists(candidate):
-                with open(candidate, 'r') as f:
-                    return f.readlines()
-            return []
-        if os.path.exists(main_path):
-            with open(main_path, 'r') as f:
-                return f.readlines()
-        return []
+    _SENSOR_IFACE_CFG_HINTS = {
+        "mgt": ["01-mgt.cfg"],
+        "host": ["01-host.cfg"],
+        "hostmgmt": ["02-hostmgmt.cfg"],
+        "data1g": ["01-data1g.cfg"],
+        "data10g": ["10-data10g.cfg"],
+    }
 
-    def _interface_block_exists(self, interface):
+    def _uses_interfaces_d_source(self):
         main_path = "/etc/network/interfaces"
         if not os.path.exists(main_path):
-            return False
+            return os.path.isdir("/etc/network/interfaces.d")
         try:
             with open(main_path, 'r') as f:
+                for line in f:
+                    if re.match(r'^\s*source\s+/etc/network/interfaces\.d/\*', line):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _iface_defined_in_file(self, interface, path):
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, 'r') as f:
                 for line in f:
                     if re.match(r'^\s*(auto|iface|allow-hotplug)\s+{}\b'.format(re.escape(interface)), line):
                         return True
         except Exception:
             return False
         return False
+
+    def _find_iface_config_path(self, interface):
+        """Return the config file that defines *interface*, or None."""
+        interfaces_d = "/etc/network/interfaces.d"
+        main_path = "/etc/network/interfaces"
+
+        for name in self._SENSOR_IFACE_CFG_HINTS.get(interface, []):
+            candidate = os.path.join(interfaces_d, name)
+            if self._iface_defined_in_file(interface, candidate):
+                return candidate
+
+        if os.path.isdir(interfaces_d):
+            for name in sorted(os.listdir(interfaces_d)):
+                if not name.endswith('.cfg'):
+                    continue
+                candidate = os.path.join(interfaces_d, name)
+                if self._iface_defined_in_file(interface, candidate):
+                    return candidate
+
+        if self._iface_defined_in_file(interface, main_path):
+            return main_path
+        return None
+
+    def _default_iface_config_path(self, interface):
+        """Return preferred write path when an interface block does not exist yet."""
+        interfaces_d = "/etc/network/interfaces.d"
+        hints = self._SENSOR_IFACE_CFG_HINTS
+        if interface in hints and (os.path.isdir(interfaces_d) or self._uses_interfaces_d_source()):
+            return os.path.join(interfaces_d, hints[interface][0])
+        return "/etc/network/interfaces"
+
+    def _write_iface_config_file_with_backup(self, path, contents):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = "{}.bak.{}".format(path, timestamp)
+        try:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    existing = f.read()
+                with open(backup_path, 'w') as f:
+                    f.write(existing)
+            normalized = [line.rstrip("\n") for line in contents]
+            with open(path, 'w') as f:
+                f.write("\n".join(normalized) + "\n")
+            return True
+        except Exception as e:
+            print('Failed to update interface configuration')
+            print(e)
+            return False
+
+    def _read_interface_config_lines(self, interface):
+        cfg_path = self._find_iface_config_path(interface)
+        if cfg_path:
+            try:
+                with open(cfg_path, 'r') as f:
+                    return f.readlines()
+            except Exception:
+                return []
+        return []
+
+    def _interface_block_exists(self, interface):
+        return self._find_iface_config_path(interface) is not None
 
     def _resolve_iface_config_name(self, interface):
         if not self.is_sensor_host_mode():
@@ -5251,8 +5308,7 @@ class AellaCli(cmd.Cmd, object):
         new_lines = [l.rstrip("\n") for l in lines]
         if new_lines and new_lines[-1].strip():
             new_lines.append("")
-        new_lines.extend(new_block)
-        return self._write_interfaces_file_with_backup(new_lines)
+        return self.update_interface_file(config_interface, new_block)
 
     def _apply_interface_config(self, interface, ip=None, gateway=None, dns_list=None):
         config_interface = self._resolve_iface_config_name(interface)
@@ -5286,10 +5342,10 @@ class AellaCli(cmd.Cmd, object):
         if start is not None:
             block_lines = lines[start:end]
             for line in block_lines:
-                if re.match(r'^\s*auto\s+{}\b'.format(re.escape(interface)), line):
+                if re.match(r'^\s*auto\s+{}\b'.format(re.escape(config_interface)), line):
                     existing_auto = True
                     continue
-                iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(interface)), line)
+                iface_match = re.match(r'^\s*iface\s+{}\s+inet\s+(\S+)'.format(re.escape(config_interface)), line)
                 if iface_match:
                     existing_mode = iface_match.group(1)
                     continue
@@ -5367,22 +5423,10 @@ class AellaCli(cmd.Cmd, object):
         return True
 
     def _get_interface_config_target_path(self, interface):
-        main_path = "/etc/network/interfaces"
-        interface_in_main = False
-        if os.path.exists(main_path):
-            try:
-                with open(main_path, 'r') as f:
-                    for line in f:
-                        if re.match(r'^\s*(auto|iface|allow-hotplug)\s+{}\s+'.format(re.escape(interface)), line):
-                            interface_in_main = True
-                            break
-            except Exception:
-                interface_in_main = False
-        if interface == 'data1g' and not interface_in_main:
-            return "/etc/network/interfaces.d/01-data1g.cfg"
-        if interface == 'data10g' and not interface_in_main:
-            return "/etc/network/interfaces.d/10-data10g.cfg"
-        return main_path
+        cfg_path = self._find_iface_config_path(interface)
+        if cfg_path:
+            return cfg_path
+        return self._default_iface_config_path(interface)
 
     def _purge_interface_dns_from_other_files(self, interface, keep_path):
         paths = []
