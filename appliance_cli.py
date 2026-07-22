@@ -40,6 +40,93 @@ import logging.handlers
 import ipaddress
 import shlex
 import termios
+import tempfile
+
+
+MGT_CONFIG_PATH = "/etc/network/interfaces.d/01-mgt.cfg"
+NETWORK_INTERFACES_PATH = "/etc/network/interfaces"
+NETWORK_INTERFACES_DIR = "/etc/network/interfaces.d"
+NTPSEC_CONFIG_PATH = "/etc/ntpsec/ntp.conf"
+NTPSEC_SERVICE = "ntpsec"
+NTPSEC_QUERY_COMMAND = ["ntpq", "-pn"]
+
+
+class _AtomicCommitError(Exception):
+    def __init__(self, cause, replaced):
+        super().__init__(str(cause))
+        self.replaced = replaced
+
+
+def _prepare_atomic_text_file(path, text):
+    """Fully prepare a same-directory temporary replacement for *path*."""
+    path = os.fspath(path)
+    directory = os.path.dirname(path) or "."
+    stat_result = os.stat(path) if os.path.exists(path) else None
+    fd = None
+    temporary_path = None
+    try:
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".{}.".format(os.path.basename(path)),
+            dir=directory,
+            text=True,
+        )
+        if stat_result is not None:
+            os.fchmod(fd, stat_result.st_mode & 0o7777)
+            try:
+                os.fchown(fd, stat_result.st_uid, stat_result.st_gid)
+            except PermissionError:
+                current = os.fstat(fd)
+                if (current.st_uid, current.st_gid) != (stat_result.st_uid, stat_result.st_gid):
+                    raise
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            fd = None
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        prepared_path = temporary_path
+        temporary_path = None
+        return prepared_path
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+def _commit_prepared_text_file(path, temporary_path):
+    """Replace *path* with a prepared file and fsync its directory."""
+    path = os.fspath(path)
+    directory = os.path.dirname(path) or "."
+    try:
+        os.replace(temporary_path, path)
+    except Exception as exc:
+        raise _AtomicCommitError(exc, replaced=False) from exc
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception as exc:
+        raise _AtomicCommitError(exc, replaced=True) from exc
+
+
+def _atomic_replace_text_file(path, text):
+    """Prepare and atomically commit one text file replacement."""
+    temporary_path = None
+    try:
+        temporary_path = _prepare_atomic_text_file(path, text)
+        _commit_prepared_text_file(path, temporary_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 # Timezone constants
 try:
@@ -792,33 +879,6 @@ class AellaCli(cmd.Cmd, object):
             return sorted(ALL_TIMEZONES)
         return []
 
-    def _read_timesyncd_ntp_servers(self, timesyncd_conf):
-        servers = []
-        if not os.path.exists(timesyncd_conf):
-            return servers
-        try:
-            with open(timesyncd_conf, 'r') as f:
-                for line in f:
-                    line_stripped = line.strip()
-                    if line_stripped.startswith('#'):
-                        continue
-                    ntp_match = re.match(r"^NTP=(.*)", line_stripped)
-                    if ntp_match:
-                        value = ntp_match.group(1).strip()
-                        if value:
-                            servers.extend(value.split())
-                        break
-        except Exception:
-            pass
-        return servers
-
-    def _write_timesyncd_conf(self, timesyncd_conf, servers):
-        content = "[Time]\n"
-        content += "NTP={}\n".format(" ".join(servers))
-        content += "FallbackNTP=\n"
-        with open(timesyncd_conf, 'w') as f:
-            f.write(content)
-
     _NTPSEC_BLOCK_BEGIN_TAGS = frozenset({
         "# === XDR_NTPSEC_CONFIG_BEGIN ===",
         "# XDR_NTPSEC_CONFIG_BEGIN",
@@ -827,6 +887,10 @@ class AellaCli(cmd.Cmd, object):
         "# === XDR_NTPSEC_CONFIG_END ===",
         "# XDR_NTPSEC_CONFIG_END",
     })
+    _NTPSEC_MARKER_PAIRS = {
+        "# === XDR_NTPSEC_CONFIG_BEGIN ===": "# === XDR_NTPSEC_CONFIG_END ===",
+        "# XDR_NTPSEC_CONFIG_BEGIN": "# XDR_NTPSEC_CONFIG_END",
+    }
 
     @staticmethod
     def _strip_ntp_conf_line(line):
@@ -840,93 +904,111 @@ class AellaCli(cmd.Cmd, object):
     def _is_ntpsec_block_end(cls, line):
         return cls._strip_ntp_conf_line(line) in cls._NTPSEC_BLOCK_END_TAGS
 
-    def _read_ntpsec_block(self, ntpsec_conf):
-        servers = []
-        lines = []
-        if not os.path.exists(ntpsec_conf):
-            return servers, None, None, lines
-        try:
-            with open(ntpsec_conf, 'r') as f:
-                lines = f.readlines()
-        except Exception:
-            return servers, None, None, lines
+    def _parse_ntpsec_managed_block(self, lines, allow_absent=False):
+        begins = [
+            (index, self._strip_ntp_conf_line(line))
+            for index, line in enumerate(lines) if self._is_ntpsec_block_begin(line)
+        ]
+        ends = [
+            (index, self._strip_ntp_conf_line(line))
+            for index, line in enumerate(lines) if self._is_ntpsec_block_end(line)
+        ]
+        if not begins and not ends:
+            if allow_absent:
+                return None, None
+            raise ValueError("NTPsec managed block not found")
+        if len(begins) != 1 or len(ends) != 1:
+            raise ValueError("Malformed NTPsec managed block markers")
+        start, begin_tag = begins[0]
+        end, end_tag = ends[0]
+        if end <= start or self._NTPSEC_MARKER_PAIRS[begin_tag] != end_tag:
+            raise ValueError("Malformed NTPsec managed block markers")
+        return start, end
 
-        start_idx = None
-        end_idx = None
-        for idx, line in enumerate(lines):
-            if self._is_ntpsec_block_begin(line):
-                start_idx = idx
+    def _render_ntpsec_change(self, original, action, targets):
+        lines = original.splitlines(keepends=True)
+        start, end = self._parse_ntpsec_managed_block(lines)
+        normalized = []
+        for target in targets:
+            target = self._normalize_ntp_target(target)
+            if target and target not in normalized:
+                normalized.append(target)
+        all_targets = set()
+        for line in lines[start + 1:end]:
+            stripped = self._strip_ntp_conf_line(line)
+            if not stripped or stripped.startswith("#"):
                 continue
-            if self._is_ntpsec_block_end(line):
-                end_idx = idx
-                break
-
-        if start_idx is None or end_idx is None or end_idx <= start_idx:
-            return servers, start_idx, end_idx, lines
-
-        for line in lines[start_idx + 1:end_idx]:
-            line_stripped = self._strip_ntp_conf_line(line)
-            if not line_stripped or line_stripped.startswith('#'):
-                continue
-            match = re.match(r"^server\s+(\S+)", line_stripped)
+            match = re.match(r"^(server|pool)\s+(\S+)", stripped)
             if match:
-                servers.append(match.group(1))
-        return servers, start_idx, end_idx, lines
+                all_targets.add(match.group(2))
+        newline = "\r\n" if "\r\n" in original else "\n"
 
-    def _read_ntpsec_block_entries(self, ntpsec_conf):
-        entries = []
-        if not os.path.exists(ntpsec_conf):
-            return entries
+        if action == "add":
+            additions = [target for target in normalized if target not in all_targets]
+            if not additions:
+                return original, False
+            peer_lines = ["server {} iburst{}".format(target, newline) for target in additions]
+            lines[end:end] = peer_lines
+            return "".join(lines), True
+
+        block = lines[start + 1:end]
+        if action == "unset":
+            target_set = set(normalized)
+            changed = False
+            kept = []
+            for line in block:
+                match = re.match(r"^\s*(server|pool)\s+(\S+)", line)
+                if match and match.group(2) in target_set:
+                    changed = True
+                    continue
+                kept.append(line)
+            if not changed:
+                return original, False
+            lines[start + 1:end] = kept
+            return "".join(lines), True
+
+        # replace: preserve every non-peer line in the managed block.
+        kept = []
+        insert_at = None
+        for line in block:
+            if re.match(r"^\s*(server|pool)\s+\S+", line):
+                if insert_at is None:
+                    insert_at = len(kept)
+                continue
+            kept.append(line)
+        if insert_at is None:
+            insert_at = len(kept)
+        kept[insert_at:insert_at] = [
+            "server {} iburst{}".format(target, newline) for target in normalized
+        ]
+        lines[start + 1:end] = kept
+        rendered = "".join(lines)
+        return rendered, rendered != original
+
+    def _commit_ntpsec_text(self, original, updated):
+        if updated == original:
+            return False
         try:
-            with open(ntpsec_conf, 'r') as f:
-                lines = f.readlines()
-        except Exception:
-            return entries
-
-        start_idx = None
-        end_idx = None
-        for idx, line in enumerate(lines):
-            if self._is_ntpsec_block_begin(line):
-                start_idx = idx
-                continue
-            if self._is_ntpsec_block_end(line):
-                end_idx = idx
-                break
-
-        if start_idx is None or end_idx is None or end_idx <= start_idx:
-            return entries
-
-        for line in lines[start_idx + 1:end_idx]:
-            line_stripped = self._strip_ntp_conf_line(line)
-            if not line_stripped or line_stripped.startswith('#'):
-                continue
-            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
-            if match:
-                entries.append("{} {}".format(match.group(1), match.group(2)))
-        return entries
-
-    def _read_ntpsec_conf_entries(self, ntpsec_conf):
-        entries = []
-        if not os.path.exists(ntpsec_conf):
-            return entries
+            _atomic_replace_text_file(NTPSEC_CONFIG_PATH, updated)
+        except Exception as exc:
+            print("Failed to update NTP configuration: {}".format(exc))
+            return False
+        if self._restart_ntp_service(NTPSEC_SERVICE):
+            return True
         try:
-            with open(ntpsec_conf, 'r') as f:
-                lines = f.readlines()
-        except Exception:
-            return entries
-
-        seen = set()
-        for line in lines:
-            line_stripped = self._strip_ntp_conf_line(line)
-            if not line_stripped or line_stripped.startswith('#'):
-                continue
-            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
-            if match:
-                entry = "{} {}".format(match.group(1), match.group(2))
-                if entry not in seen:
-                    seen.add(entry)
-                    entries.append(entry)
-        return entries
+            _atomic_replace_text_file(NTPSEC_CONFIG_PATH, original)
+        except Exception as exc:
+            print(
+                "CRITICAL: Failed to restore NTP configuration: {} "
+                "Manual recovery is required.".format(exc)
+            )
+            return False
+        if not self._restart_ntp_service(NTPSEC_SERVICE):
+            print(
+                "NTPsec restart failed after restoring the original configuration. "
+                "Run 'sudo -n systemctl restart {}' manually.".format(NTPSEC_SERVICE)
+            )
+        return False
 
     def _normalize_ntp_target(self, target_raw):
         target = target_raw.strip().replace('\r', '')
@@ -935,108 +1017,14 @@ class AellaCli(cmd.Cmd, object):
             target = match.group(2).strip()
         return target
 
-    def _remove_ntpsec_block_target(self, ntpsec_conf, target):
-        if not os.path.exists(ntpsec_conf):
+    def _is_valid_ntp_target(self, target):
+        if not target:
             return False
-        try:
-            with open(ntpsec_conf, 'r') as f:
-                lines = f.readlines()
-        except Exception:
+        if self.valid_ipv4_address(target):
+            return True
+        if re.fullmatch(r"[\d.]+", target):
             return False
-
-        start_idx = None
-        end_idx = None
-        for idx, line in enumerate(lines):
-            if self._is_ntpsec_block_begin(line):
-                start_idx = idx
-                continue
-            if self._is_ntpsec_block_end(line):
-                end_idx = idx
-                break
-
-        if start_idx is None or end_idx is None or end_idx <= start_idx:
-            return False
-
-        removed = False
-        new_block_lines = []
-        for line in lines[start_idx + 1:end_idx]:
-            line_stripped = self._strip_ntp_conf_line(line)
-            if not line_stripped or line_stripped.startswith('#'):
-                new_block_lines.append(line)
-                continue
-            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
-            if match and match.group(2) == target:
-                removed = True
-                continue
-            new_block_lines.append(line)
-
-        if not removed:
-            return False
-
-        new_lines = lines[:start_idx + 1] + new_block_lines + lines[end_idx:]
-        with open(ntpsec_conf, 'w') as f:
-            f.writelines(new_lines)
-        return True
-
-    def _remove_ntpsec_conf_target(self, ntpsec_conf, target):
-        if not os.path.exists(ntpsec_conf):
-            return False
-        try:
-            with open(ntpsec_conf, 'r') as f:
-                lines = f.readlines()
-        except Exception:
-            return False
-
-        removed = False
-        new_lines = []
-        for line in lines:
-            line_stripped = self._strip_ntp_conf_line(line)
-            if not line_stripped or line_stripped.startswith('#'):
-                new_lines.append(line)
-                continue
-            match = re.match(r"^(server|pool)\s+(\S+)", line_stripped)
-            if match and match.group(2) == target:
-                removed = True
-                continue
-            new_lines.append(line)
-
-        if not removed:
-            return False
-
-        with open(ntpsec_conf, 'w') as f:
-            f.writelines(new_lines)
-        return True
-
-    def _extract_ntp_entry_target(self, entry):
-        parts = entry.split(None, 1)
-        if len(parts) == 2:
-            return parts[1]
-        return entry
-
-    def _write_ntpsec_block(self, ntpsec_conf, servers):
-        begin_tag = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
-        end_tag = "# === XDR_NTPSEC_CONFIG_END ==="
-        servers = [s for s in servers if s]
-        block_lines = [begin_tag + "\n"]
-        for server in servers:
-            block_lines.append("server {} iburst\n".format(server))
-        block_lines.append(end_tag + "\n")
-
-        current_servers, start_idx, end_idx, lines = self._read_ntpsec_block(ntpsec_conf)
-        if not lines:
-            lines = []
-
-        if start_idx is None or end_idx is None or end_idx <= start_idx:
-            if lines and not lines[-1].endswith("\n"):
-                lines[-1] = lines[-1] + "\n"
-            if lines and lines[-1].strip():
-                lines.append("\n")
-            lines.extend(block_lines)
-        else:
-            lines = lines[:start_idx] + block_lines + lines[end_idx + 1:]
-
-        with open(ntpsec_conf, 'w') as f:
-            f.writelines(lines)
+        return self.is_valid_hostname(target)
 
     def _parse_ntpq_output(self, output):
         peers = []
@@ -1068,27 +1056,6 @@ class AellaCli(cmd.Cmd, object):
                 warnings.append("warning: peer {} reach={} st={} refid={}".format(remote, reach, st, refid))
         return peers, reachable, warnings
 
-    def _get_timesync_status(self):
-        server = ""
-        stratum = ""
-        offset = ""
-        try:
-            out = subprocess.check_output(
-                ["timedatectl", "timesync-status"],
-                stderr=subprocess.PIPE, timeout=5
-            ).decode("utf-8").strip()
-            for line in out.splitlines():
-                line_stripped = line.strip()
-                if line_stripped.startswith("Server:"):
-                    server = line_stripped.split(":", 1)[1].strip()
-                elif line_stripped.startswith("Stratum:"):
-                    stratum = line_stripped.split(":", 1)[1].strip()
-                elif line_stripped.startswith("Offset:"):
-                    offset = line_stripped.split(":", 1)[1].strip()
-            return server, stratum, offset, None
-        except Exception as e:
-            return "", "", "", e
-
     def _restart_ntp_service(self, service_name):
         proc = subprocess.run(
             ["sudo", "-n", "systemctl", "restart", service_name],
@@ -1097,290 +1064,31 @@ class AellaCli(cmd.Cmd, object):
             check=False,
         )
         if proc.returncode != 0:
-            print("NTP config updated but {} restart FAILED".format(service_name))
+            print("Failed to restart NTP service: {}".format(service_name))
             print("Check sudo NOPASSWD for: systemctl restart {}".format(service_name))
             return False
         return True
 
-    def show_ntp_callback(self, key, param):
-        status = 0
-        output = None
-
-        try:
-            ntp_backend, ntp_conf, service_name = self._detect_ntp_type()
-            output_lines = ["\n[backend]", ntp_backend, ""]
-
-            if ntp_backend == "ntpsec":
-                cli_entries = self._read_ntpsec_block_entries(ntp_conf)
-                output_lines.append("[configured NTP servers - CLI managed]")
-                if cli_entries:
-                    for entry in cli_entries:
-                        output_lines.append("- {}".format(entry))
-                else:
-                    output_lines.append("(none)")
-
-                conf_entries = self._read_ntpsec_conf_entries(ntp_conf)
-                output_lines.append("\n[configured NTP servers - from ntp.conf]")
-                if conf_entries:
-                    for entry in conf_entries:
-                        output_lines.append("- {}".format(entry))
-                else:
-                    output_lines.append("(none)")
-
-                output_lines.append("\n[service]")
-                service_status = "unknown"
-                enabled_status = "unknown"
-                try:
-                    service_status = subprocess.check_output(
-                        ["systemctl", "is-active", service_name],
-                        stderr=subprocess.PIPE
-                    ).decode("utf-8").strip()
-                except Exception:
-                    service_status = "unknown"
-                try:
-                    enabled_status = subprocess.check_output(
-                        ["systemctl", "is-enabled", service_name],
-                        stderr=subprocess.PIPE
-                    ).decode("utf-8").strip()
-                except Exception:
-                    enabled_status = "unknown"
-                output_lines.append("- {}: {} ({})".format(service_name, service_status, enabled_status))
-
-                output_lines.append("\n[runtime sync status]")
-                ntpq_proc = subprocess.run(
-                    ["ntpq", "-pn"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                if ntpq_proc.returncode != 0:
-                    output_lines.append("(failed - ntpq not available)")
-                    output = "\n".join(output_lines) + "\n"
-                    print(output)
-                    return status, output
-
-                output_lines.extend(ntpq_proc.stdout.splitlines())
-
-                peers, _, warnings = self._parse_ntpq_output(ntpq_proc.stdout)
-                if peers:
-                    all_st16_or_dns = True
-                    all_reach_zero = True
-                    for peer in peers:
-                        st = peer[2]
-                        reach = peer[3]
-                        reach_int = None
-                        if reach.isdigit():
-                            try:
-                                reach_int = int(reach, 8)
-                            except Exception:
-                                reach_int = None
-                        if st != "16":
-                            all_st16_or_dns = False
-                        if reach_int is None or reach_int > 0:
-                            all_reach_zero = False
-                    if all_st16_or_dns or all_reach_zero:
-                        output_lines.append("warning: peers not reachable yet (st=16/.DNS or reach=0)")
-                elif warnings:
-                    output_lines.append("warning: peers not reachable yet (st=16/.DNS or reach=0)")
-
-                output = "\n".join(output_lines) + "\n"
-                print(output)
-                return status, output
-
-            timesyncd_conf = "/etc/systemd/timesyncd.conf"
-            server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
-            output_lines.append("[configured NTP servers]")
-            if server_list:
-                for server in server_list:
-                    output_lines.append("- {}".format(server))
-            else:
-                output_lines.append("(no NTP servers configured by CLI)")
-
-            output_lines.append("\n[service]")
-            service_status = "unknown"
-            enabled_status = "unknown"
-            try:
-                service_status = subprocess.check_output(
-                    ["systemctl", "is-active", service_name],
-                    stderr=subprocess.PIPE
-                ).decode("utf-8").strip()
-            except Exception:
-                service_status = "unknown"
-            try:
-                enabled_status = subprocess.check_output(
-                    ["systemctl", "is-enabled", service_name],
-                    stderr=subprocess.PIPE
-                ).decode("utf-8").strip()
-            except Exception:
-                enabled_status = "unknown"
-            output_lines.append("- {}: {} ({})".format(service_name, service_status, enabled_status))
-
-            output_lines.append("\n[runtime sync status]")
-            warnings = []
-            status_proc = subprocess.run(
-                ["timedatectl", "timesync-status"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            if status_proc.returncode != 0:
-                output_lines.append("(failed - timedatectl not available)")
-                output = "\n".join(output_lines) + "\n"
-                print(output)
-                return status, output
-
-            fields = {}
-            for line in status_proc.stdout.splitlines():
-                if ":" not in line:
-                    continue
-                key, value = line.split(":", 1)
-                fields[key.strip()] = value.strip()
-
-            server_value = fields.get("Server", "")
-            if not server_value or server_value.lower() in ("n/a", "none"):
-                warnings.append("Not synchronized yet (check DNS/UDP123/connectivity)")
-            else:
-                if "ntp.ubuntu.com" in server_value and server_list:
-                    warnings.append("Configured servers exist but active server is still default; restart or connectivity may be required")
-
-            output_lines.append("Server        : {}".format(server_value if server_value else "(none)"))
-            output_lines.append("Stratum       : {}".format(fields.get("Stratum", "(none)")))
-            output_lines.append("Poll interval : {}".format(fields.get("Poll interval", "(none)")))
-            output_lines.append("Offset        : {}".format(fields.get("Offset", "(none)")))
-            output_lines.append("Delay         : {}".format(fields.get("Delay", "(none)")))
-            output_lines.append("Jitter        : {}".format(fields.get("Jitter", "(none)")))
-            output_lines.append("Packet count  : {}".format(fields.get("Packet count", "(none)")))
-            output_lines.append("Frequency     : {}".format(fields.get("Frequency", "(none)")))
-            last_sync = fields.get("Last sync", "")
-            if last_sync:
-                output_lines.append("Last sync     : {}".format(last_sync))
-            output_lines.extend(warnings)
-
-            output = "\n".join(output_lines) + "\n"
-            print(output)
-            return status, output
-
-        except Exception as e:
-            print("Failed to get ntp servers: {}\n".format(e))
-            return 1, None
-    
-
     def show_dns_callback(self, key, param):
-        """Show DNS servers configured in interface configuration files"""
-        status = 0
-        output = None
-        dns_servers = []
-        interfaces_with_dns = {}
-
-        def _dedupe_preserve_order(items):
-            seen = set()
-            result = []
-            for item in items:
-                if item in seen:
-                    continue
-                seen.add(item)
-                result.append(item)
-            return result
-        
+        """Show DNS servers from the canonical management stanza only."""
         try:
-            # Read /etc/network/interfaces
-            interfaces_file = "/etc/network/interfaces"
-            if os.path.exists(interfaces_file):
-                with open(interfaces_file, 'r') as f:
-                    lines = f.readlines()
-                    current_interface = None
-                    for line in lines:
-                        # Match interface name
-                        iface_match = re.match(r'^\s*(auto|iface)\s+(\S+)', line)
-                        if iface_match:
-                            current_interface = iface_match.group(2)
-                        # Match dns-nameservers
-                        dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
-                        if dns_match and current_interface:
-                            dns_list = dns_match.group(1).strip().split()
-                            # Filter valid IP addresses
-                            valid_dns = [dns for dns in dns_list if self.valid_ipv4_address(dns)]
-                            if valid_dns:
-                                if current_interface not in interfaces_with_dns:
-                                    interfaces_with_dns[current_interface] = []
-                                interfaces_with_dns[current_interface].extend(valid_dns)
-                                dns_servers.extend(valid_dns)
-            
-            # Read /etc/network/interfaces.d/*.cfg files
-            interfaces_d_dir = "/etc/network/interfaces.d"
-            if os.path.exists(interfaces_d_dir):
-                for filename in os.listdir(interfaces_d_dir):
-                    if filename.endswith('.cfg'):
-                        filepath = os.path.join(interfaces_d_dir, filename)
-                        try:
-                            with open(filepath, 'r') as f:
-                                lines = f.readlines()
-                                current_interface = None
-                                for line in lines:
-                                    # Match interface name
-                                    iface_match = re.match(r'^\s*(auto|iface)\s+(\S+)', line)
-                                    if iface_match:
-                                        current_interface = iface_match.group(2)
-                                    # Match dns-nameservers
-                                    dns_match = re.match(r'^\s*dns-nameservers\s+(.+)', line)
-                                    if dns_match and current_interface:
-                                        dns_list = dns_match.group(1).strip().split()
-                                        # Filter valid IP addresses
-                                        valid_dns = [dns for dns in dns_list if self.valid_ipv4_address(dns)]
-                                        if valid_dns:
-                                            if current_interface not in interfaces_with_dns:
-                                                interfaces_with_dns[current_interface] = []
-                                            interfaces_with_dns[current_interface].extend(valid_dns)
-                                            dns_servers.extend(valid_dns)
-                        except Exception:
-                            continue
-            
-            # Remove duplicates while preserving order
-            unique_dns = _dedupe_preserve_order(dns_servers)
-            for iface in list(interfaces_with_dns.keys()):
-                interfaces_with_dns[iface] = _dedupe_preserve_order(interfaces_with_dns[iface])
-            
-            # Format output
-            output = "\n"
-            if interfaces_with_dns:
-                output += "DNS servers configured per interface:\n"
-                for iface in sorted(interfaces_with_dns.keys()):
-                    dns_list = interfaces_with_dns[iface]
-                    output += "  {}: {}\n".format(iface, " ".join(dns_list))
-                output += "\nAll DNS servers:\n"
-                for dns in unique_dns:
-                    output += "  {}\n".format(dns)
-            elif unique_dns:
-                # Fallback: just show DNS servers if no interface info
-                output += "DNS servers:\n"
-                for dns in unique_dns:
-                    output += "  {}\n".format(dns)
+            text = self._read_text_exact(MGT_CONFIG_PATH)
+            lines, start, end = self._mgt_static_stanza_bounds(text)
+            dns = []
+            for line in lines[start + 1:end]:
+                match = re.match(r"^\s*dns-nameservers\s+(.+?)(?:\r?\n)?$", line)
+                if match:
+                    dns.extend(match.group(1).split())
+            if dns:
+                output = "Management DNS servers:\n"
+                output += "".join("  {}\n".format(item) for item in dns)
+                output += "Configuration source:\n  {}".format(MGT_CONFIG_PATH)
             else:
-                # No DNS found in interface configs, try resolv.conf as fallback
-                try:
-                    cmd = "cat /etc/resolv.conf 2>/dev/null"
-                    check_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    result = check_proc.communicate()[0]
-                    if result:
-                        result = result.decode()
-                        tokens = re.findall(r"nameserver\s+(\d+\.\d+\.\d+\.\d+)", result)
-                        if tokens:
-                            output += "DNS servers (from /etc/resolv.conf):\n"
-                            for dns in tokens:
-                                if dns != '127.0.0.53':  # Skip systemd-resolved stub
-                                    output += "  {}\n".format(dns)
-                        else:
-                            output += "No DNS servers configured\n"
-                    else:
-                        output += "No DNS servers configured\n"
-                except Exception:
-                    output += "No DNS servers configured\n"
-            output += "\n"
+                output = "No DNS servers configured for mgt"
+            status = 0
         except Exception as e:
             output = "\nFailed to get DNS servers: {}\n".format(e)
-        
+            status = 1
         print(output)
         return status, output
 
@@ -1515,7 +1223,7 @@ class AellaCli(cmd.Cmd, object):
         self.shell_cmd_exec('ethtool -i {0} 2>/dev/null | grep -E "^driver|^version|^firmware-version|^bus-info"'.format(iface))
 
     def set_interface_sensor(self, param):
-        """Configure host interface for Sensor host (uses /etc/network/interfaces)."""
+        """Reject host network changes in Sensor bridge mode."""
         self._debug_print("DEBUG set interface param={}".format(param))
         param = [p for p in param if p != '']
         if not param or len(param) < 1:
@@ -1527,210 +1235,44 @@ class AellaCli(cmd.Cmd, object):
             print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
             return
 
-        if not self.is_device_exist(interface):
-            return
+        print(
+            "Host IP configuration is not managed by this CLI in Sensor bridge mode.\n"
+            "Configure the Sensor VM management IP inside the Sensor VM."
+        )
+        return
 
-        if len(param) >= 2 and param[1] == 'restart':
-            print('Restarting network interface. You need to use new IP address to reconnect...\n')
-            self._restart_interface_with_verification(interface)
-            return
-
-        if len(param) == 1 or (len(param) == 2 and param[1] == '?') or (len(param) == 2 and param[1].endswith('?')):
-            print('\nip <IP Address/Netmask>   Specify interface IP address and netmask')
-            print('gateway <IP Address>      Specify default gateway IP address')
-            print('dns <IP Address> [...]    Specify DNS server IP address(es) separated by space')
-            print('restart                   Restart network interface\n')
-            return
-
-        option = param[1]
-        if option not in ['ip', 'gateway', 'dns', 'restart']:
-            print('Invalid option: Available options are "ip", "gateway", "dns" and "restart"\n')
-            return
-
-        # Reuse existing validation and implementation by calling set_interface_callback2
-        # which edits /etc/network/interfaces. For restart, keep existing restart logic.
-        tokens = [t for t in param[1:]]
-        keywords = [t.lower() for t in tokens if t.lower() in {"ip", "gateway", "dns", "restart"}]
-        if len(keywords) > 1 or ("restart" in keywords and len(tokens) > 1):
-            try:
-                parsed = self._parse_set_interface_args(tokens)
-            except ValueError as e:
-                print('{}\n'.format(e))
-                return
-            if parsed["dns"] and not parsed["ip"]:
-                print('DNS must be set together with IP address on host interface\n')
-                print('Example: set interface {0} ip <IP/Mask> dns <DNS1> [DNS2 ...]\n'.format(interface))
-                return
-            if parsed["ip"]:
-                if '/' not in parsed["ip"] and self.valid_ipv4_address(parsed["ip"]):
-                    print('Please specify network mask: {0}\n'.format(parsed["ip"]))
-                    return
-                if not self.valid_ipv4_address(parsed["ip"]) or '/' not in parsed["ip"]:
-                    print('\n<IP Address/Netmask>   Specify interface IP address and netmask\n')
-                    return
-            if parsed["gateway"]:
-                if not self.valid_ipv4_address(parsed["gateway"]) or '/' in parsed["gateway"]:
-                    print('\n<IP Address>      Specify default gateway IP address\n')
-                    return
-            if parsed["dns"]:
-                for d in parsed["dns"]:
-                    if not self.valid_ipv4_address(d):
-                        print('Invalid DNS server IP address format: {0}\n'.format(d))
-                        return
-
-            if not self._apply_interface_config(
-                interface,
-                ip=parsed["ip"],
-                gateway=parsed["gateway"],
-                dns_list=parsed["dns"],
-            ):
-                return
-            if parsed["restart"]:
-                print('Restarting network interface. You need to use new IP address to reconnect...\n')
-                if not self._restart_interface_with_verification(interface):
-                    return
-            else:
-                print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
-            return
-
-        if option == 'restart':
-            print('Restarting network interface. You need to use new IP address to reconnect...\n')
-            self._restart_interface_with_verification(interface)
-            return
-
-        # Minimal validation (use existing helper)
-        if option == 'ip':
-            if len(param) < 3 or not self.valid_ipv4_address(param[2]):
-                print('\n<IP Address/Netmask>   Specify interface IP address and netmask\n')
-                return
-            if '/' not in param[2]:
-                print('Please specify network mask: {0}\n'.format(param[2]))
-                return
-        if option == 'gateway':
-            if len(param) < 3 or not self.valid_ipv4_address(param[2]) or '/' in param[2]:
-                print('\n<IP Address>      Specify default gateway IP address\n')
-                return
-        if option == 'dns':
-            print('DNS must be set together with IP address on host interface\n')
-            print('Example: set interface {0} ip <IP/Mask> dns <DNS1> [DNS2 ...]\n'.format(interface))
-            return
-
-        if option == 'ip':
-            if not self._apply_interface_config(interface, ip=param[2]):
-                return
-        elif option == 'gateway':
-            if not self._apply_interface_config(interface, gateway=param[2]):
-                return
-        else:
-            return
-
-        print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
 
     def unset_interface_sensor(self, param):
-        """Unset host interface configuration for Sensor host (uses /etc/network/interfaces)."""
-        if not param or len(param) < 1:
-            print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
+        """Reject host network removals in Sensor bridge mode."""
+        param = [p for p in param if p != ""]
+        if not param or param[0].endswith("?") or param[0] == "?":
+            print("\n<Interface Name>  Specify an existing host interface/bridge name\n")
             return
-
-        interface = param[0].rstrip('?')
-        if param[0].endswith('?') or interface == '?':
-            print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
-            return
-
-        if not self.is_device_exist(interface):
-            return
-
-        if len(param) == 1 or (len(param) == 2 and param[1] == '?') or (len(param) == 2 and param[1].endswith('?')):
-            print('\nip         Unset the IP address on the interface {}'.format(interface))
-            print('gateway    Unset the default gateway on the interface {}'.format(interface))
-            print('restart    Restart network interface\n')
-            return
-
-        option = param[1]
-        if option not in ['ip', 'gateway', 'restart']:
-            print('Invalid option: Available options are "ip", "gateway" and "restart"\n')
-            return
-
-        if option == 'restart':
-            print('Restarting network interface. You need to use new IP address to reconnect...\n')
-            self._restart_interface_with_verification(interface)
-            return
-
-        # Use existing unset logic but without DP-only restrictions by temporarily bypassing checks
-        # Edit the on-disk interface stanza (main file or interfaces.d/*.cfg)
-        try:
-            config_interface = self._resolve_iface_config_name(interface)
-            conf_path = self._find_iface_config_path(config_interface)
-            if not conf_path:
-                conf_path = self._default_iface_config_path(config_interface)
-            if not os.path.exists(conf_path):
-                print('Could not find {}'.format(conf_path))
-                return
-            with open(conf_path, 'r') as f:
-                lines = f.readlines()
-
-            out = []
-            in_block = False
-            for line in lines:
-                if re.match(r'^\s*iface\s+{}\s+'.format(re.escape(config_interface)), line):
-                    in_block = True
-                    out.append(line)
-                    continue
-                if in_block:
-                    if re.match(r'^\s*iface\s+\S+\s+', line) or re.match(r'^\s*auto\s+\S+', line):
-                        in_block = False
-                    if in_block:
-                        if option == 'ip' and re.match(r'^\s*address\s+', line):
-                            continue
-                        if option == 'ip' and re.match(r'^\s*netmask\s+', line):
-                            continue
-                        if option == 'ip' and re.match(r'^\s*(gateway|dns-nameservers)\s+', line):
-                            # keep gateway/dns unless explicitly removing gateway
-                            out.append(line)
-                            continue
-                        if option == 'gateway' and re.match(r'^\s*gateway\s+', line):
-                            continue
-                        out.append(line)
-                        continue
-                out.append(line)
-
-            if not self._write_iface_config_file_with_backup(conf_path, out):
-                return
-
-            print("Run 'unset interface {0} restart' command to apply the changes.\n".format(interface))
-        except Exception as e:
-            print('Failed to unset interface configuration: {}'.format(e))
+        print(
+            "Host IP configuration is not managed by this CLI in Sensor bridge mode.\n"
+            "Configure the Sensor VM management IP inside the Sensor VM."
+        )
 
     def show_gateway_callback(self, key, param):
-        if self.is_sensor_host_mode():
-            self.show_gateway_sensor()
-            return
-
-        def check_default_gw(cmd):
-            try:
-                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-                res = p.communicate() 
-                if res[0]:
-                    m = re.match("default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\w+)", res[0].decode('utf-8').rstrip())
-                    return m
-            except Exception as e:
-                print("Failed to get gateway: {}".format(e))
-
-        # find mgt network default gateway
-        cmd = "ip route show table 1 | grep default"
-        result = check_default_gw(cmd)
-        if result:
-            print('\nManagement network gateway {} via {} interface'.format(result.group(1), result.group(2)))
-        else:
-            print('\nManagement network gateway is not configured or applied')
-
-        # find data network gateway
-        cmd = "ip route show table 2 | grep default"
-        result = check_default_gw(cmd)
-        if result:
-            print('Data network gateway {} via {} interface\n'.format(result.group(1), result.group(2)))
-        else:
-            print('Data network gateway is not configured or applied\n')
+        try:
+            text = self._read_text_exact(MGT_CONFIG_PATH)
+            lines, start, end = self._mgt_static_stanza_bounds(text)
+            gateway = None
+            for line in lines[start + 1:end]:
+                match = re.match(r"^\s*gateway\s+(\S+)", line)
+                if match:
+                    gateway = match.group(1)
+                    break
+            print("\nConfigured management gateway: {}".format(gateway or "(none)"))
+            runtime = subprocess.run(
+                ["ip", "-4", "route", "show", "table", "main", "default"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            if runtime.returncode == 0 and runtime.stdout.strip():
+                print("Runtime main-table default: {}".format(runtime.stdout.strip()))
+            print("")
+        except Exception as exc:
+            print("Failed to get gateway: {}".format(exc))
 
     def show_service(self, key, param):
         if key:
@@ -1775,6 +1317,12 @@ class AellaCli(cmd.Cmd, object):
         print('')
 
     def show_interface_callback(self, key, param):
+        if param and param[0].rstrip("?") == "mgt":
+            if param[0].endswith("?"):
+                print("\nPress [Enter]\n")
+                return
+            self.shell_cmd_exec("sudo ifconfig mgt 2>/dev/null")
+            return
         if self.is_sensor_host_mode():
             self.show_interface_sensor(param)
             return
@@ -2039,163 +1587,26 @@ class AellaCli(cmd.Cmd, object):
         self.shell_cmd_exec('sudo date -s "' + date + " " + time + '"')
 
     def _detect_ntp_type(self):
-        """Detect which NTP backend is in use"""
-        ntpsec_conf = "/etc/ntpsec/ntp.conf"
-        if os.path.exists(ntpsec_conf):
-            return "ntpsec", ntpsec_conf, "ntpsec"
-        try:
-            out = subprocess.check_output(
-                ["systemctl", "is-active", "ntpsec"],
-                stderr=subprocess.PIPE
-            ).decode("utf-8").strip()
-            if out == "active":
-                return "ntpsec", ntpsec_conf, "ntpsec"
-        except Exception:
-            pass
+        """Validate that the supported NTPsec backend is usable."""
+        error = "NTPsec is not installed or /etc/ntpsec/ntp.conf is missing."
+        if not os.path.isfile(NTPSEC_CONFIG_PATH):
+            raise RuntimeError(error)
+        service = subprocess.run(
+            ["systemctl", "cat", NTPSEC_SERVICE],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if service.returncode != 0:
+            raise RuntimeError(error)
+        if not shutil.which(NTPSEC_QUERY_COMMAND[0]):
+            raise RuntimeError(error)
+        query = subprocess.run(
+            NTPSEC_QUERY_COMMAND,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if query.returncode not in (0, 1):
+            raise RuntimeError(error)
+        return "ntpsec", NTPSEC_CONFIG_PATH, NTPSEC_SERVICE
 
-        return "systemd-timesyncd", "/etc/systemd/timesyncd.conf", "systemd-timesyncd"
-
-    def set_ntp_callback(self, key, param):
-        if not param or param[0].endswith('?') or len(param) < 1:
-            print('\n<NTP server> \t Specify NTP server name or IP address\n')
-            return
-
-        try:
-            action = "add"
-            servers = []
-            if param[0] in ("add", "replace"):
-                action = param[0]
-                servers = param[1:]
-            else:
-                servers = param
-
-            if not servers:
-                print('\n<NTP server> \t Specify NTP server name or IP address\n')
-                return
-
-            for server in servers:
-                if not self.is_valid_hostname(server):
-                    print('Invalid NTP hostname: Please enter the correct hostname')
-                    print('\n<NTP server> \t Specify NTP server name or IP address\n')
-                    return
-
-            ntp_backend, ntp_conf, service_name = self._detect_ntp_type()
-
-            if ntp_backend == "ntpsec":
-                if not ntp_conf or not os.path.exists(ntp_conf):
-                    print("NTP config file not found. Please ensure NTP service is installed.\n")
-                    return
-
-                current_servers, _, _, _ = self._read_ntpsec_block(ntp_conf)
-                if action == "replace":
-                    seen = set()
-                    new_servers = []
-                    for server in servers:
-                        if server not in seen:
-                            seen.add(server)
-                            new_servers.append(server)
-                else:
-                    new_servers = list(current_servers)
-                    for server in servers:
-                        if server not in new_servers:
-                            new_servers.append(server)
-
-                if action == "add" and new_servers == current_servers:
-                    if len(servers) == 1:
-                        print("NTP server {} already configured\n".format(servers[0]))
-                    else:
-                        print("NTP servers already configured\n")
-                    return
-
-                self._write_ntpsec_block(ntp_conf, new_servers)
-                if not self._restart_ntp_service(service_name):
-                    return
-
-                ntpq_proc = subprocess.run(
-                    ["ntpq", "-pn"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                warning_needed = True
-                warnings = []
-                if ntpq_proc.returncode == 0:
-                    peers, reachable, _ = self._parse_ntpq_output(ntpq_proc.stdout)
-                    if peers and reachable:
-                        warning_needed = False
-                    else:
-                        warnings.append("NTP configured but peers not reachable yet")
-                        warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
-                else:
-                    warnings.append("NTP configured but peers not reachable yet")
-                    warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
-
-                if action == "replace":
-                    print("Successfully replaced ntp servers\n")
-                    result_msg = "Successfully replaced ntp servers\n"
-                elif len(servers) == 1:
-                    print("Successfully set ntp {}\n".format(servers[0]))
-                    result_msg = "Successfully set ntp {}\n".format(servers[0])
-                else:
-                    print("Successfully set ntp servers\n")
-                    result_msg = "Successfully set ntp servers\n"
-
-                if warning_needed:
-                    for line in warnings:
-                        print(line)
-                return result_msg
-
-            timesyncd_conf = "/etc/systemd/timesyncd.conf"
-            server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
-            if action == "replace":
-                seen = set()
-                new_servers = []
-                for server in servers:
-                    if server not in seen:
-                        seen.add(server)
-                        new_servers.append(server)
-            else:
-                new_servers = list(server_list)
-                for server in servers:
-                    if server not in new_servers:
-                        new_servers.append(server)
-
-            if action == "add" and new_servers == server_list:
-                if len(servers) == 1:
-                    print("NTP server {} already configured\n".format(servers[0]))
-                else:
-                    print("NTP servers already configured\n")
-                return
-
-            self._write_timesyncd_conf(timesyncd_conf, new_servers)
-            if not self._restart_ntp_service(service_name):
-                return "Failed to set ntp {}\n".format(servers[0])
-
-            server, _, _, error = self._get_timesync_status()
-            warnings = []
-            if error or not server or "ntp.ubuntu.com" in server:
-                warnings.append("NTP configured but peers not reachable yet")
-                warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
-
-            if action == "replace":
-                print("Successfully replaced ntp servers\n")
-                result_msg = "Successfully replaced ntp servers\n"
-            elif len(servers) == 1:
-                print("Successfully set ntp {}\n".format(servers[0]))
-                result_msg = "Successfully set ntp {}\n".format(servers[0])
-            else:
-                print("Successfully set ntp servers\n")
-                result_msg = "Successfully set ntp servers\n"
-
-            for line in warnings:
-                print(line)
-            return result_msg
-
-        except Exception as e:
-            print("Failed to set ntp {}: {}\n".format(param[0], e))
-            return "Failed to set ntp {}\n".format(param[0])
-    
     def set_dns_callback(self, key, param):
         """Configure DNS servers for a network interface"""
         if not param or param[0].endswith('?') or len(param) < 2:
@@ -2207,8 +1618,8 @@ class AellaCli(cmd.Cmd, object):
         if param[0].endswith('?') or interface == '?':
             print('\n<Interface Name> <DNS IP> [...]  Specify interface name and DNS server IP address(es)\n')
             return
-        
-        if not self.is_device_exist(interface):
+        if interface != "mgt":
+            print('Invalid option: Only "mgt" interface supports DNS configuration')
             return
         
         # Validate DNS IP addresses
@@ -2218,10 +1629,107 @@ class AellaCli(cmd.Cmd, object):
                 print('Invalid DNS server IP address format: {}\n'.format(dns))
                 return
         
-        # Use set_interface_callback2 to set DNS
-        # Format: set interface <interface> dns <dns1> <dns2> ...
-        self.set_interface_callback2([interface, 'dns'] + dns_servers)
-        print("DNS servers configured for interface {}. Run 'set interface {} restart' to apply.\n".format(interface, interface))
+        if self._update_mgt_ipv4_config(dns_servers=dns_servers):
+            if self._mgt_last_changed:
+                print("Configuration updated successfully.")
+                print("Run 'set interface mgt restart' to apply the changes.")
+
+    def _ntpsec_operation(self, action, targets):
+        try:
+            self._detect_ntp_type()
+            original = self._read_text_exact(NTPSEC_CONFIG_PATH)
+            updated, changed = self._render_ntpsec_change(original, action, targets)
+        except Exception as exc:
+            print("Failed to update NTP configuration: {}".format(exc))
+            return False
+        if not changed:
+            if action == "unset":
+                print("NTP server not found in CLI-managed block")
+            else:
+                print("NTP configuration is unchanged")
+            return False
+        if not self._commit_ntpsec_text(original, updated):
+            return False
+        query = subprocess.run(
+            NTPSEC_QUERY_COMMAND,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if query.returncode == 0:
+            peers, _, _ = self._parse_ntpq_output(query.stdout)
+            reach_zero = False
+            for peer in peers:
+                try:
+                    if int(peer[3], 8) == 0:
+                        reach_zero = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if reach_zero:
+                print("Warning: NTP peers currently have reach=0")
+        return True
+
+    def set_ntp_callback(self, key, param):
+        if not param or param[0].endswith("?"):
+            print("\n<NTP server> \t Specify NTP server name or IP address\n")
+            return
+        action = "add"
+        targets = list(param)
+        if param[0] in ("add", "replace"):
+            action = param[0]
+            targets = param[1:]
+        if not targets:
+            print("\n<NTP server> \t Specify NTP server name or IP address\n")
+            return
+        targets = [self._normalize_ntp_target(target) for target in targets]
+        if any(not self._is_valid_ntp_target(target) for target in targets):
+            print("Invalid NTP hostname: Please enter the correct hostname")
+            return
+        if self._ntpsec_operation(action, targets):
+            if action == "replace":
+                print("Successfully replaced ntp servers\n")
+            else:
+                print("Successfully set ntp servers\n")
+            return 0
+        return 1
+
+    def show_ntp_callback(self, key, param):
+        try:
+            self._detect_ntp_type()
+            lines = self._read_text_exact(NTPSEC_CONFIG_PATH).splitlines(keepends=True)
+            start, end = self._parse_ntpsec_managed_block(lines)
+            entries = []
+            if start is not None:
+                for line in lines[start + 1:end]:
+                    match = re.match(r"^\s*(server|pool)\s+(\S+)", line)
+                    if match:
+                        entries.append("{} {}".format(match.group(1), match.group(2)))
+            active = subprocess.run(
+                ["systemctl", "is-active", NTPSEC_SERVICE],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            enabled = subprocess.run(
+                ["systemctl", "is-enabled", NTPSEC_SERVICE],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            query = subprocess.run(
+                NTPSEC_QUERY_COMMAND,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            output = "\n[configured NTP servers - CLI managed]\n"
+            output += "".join("- {}\n".format(entry) for entry in entries) or "(none)\n"
+            output += "\n[service]\n- {}: {} ({})\n".format(
+                NTPSEC_SERVICE,
+                active.stdout.strip() if active.returncode == 0 else "inactive",
+                enabled.stdout.strip() if enabled.returncode == 0 else "disabled",
+            )
+            output += "\n[runtime sync status]\n"
+            output += query.stdout if query.returncode == 0 else "(ntpq query failed)\n"
+            print(output)
+            return 0, output
+        except Exception as exc:
+            output = "Failed to get ntp servers: {}\n".format(exc)
+            print(output)
+            return 1, output
 
     def _get_local_interface_ips(self):
         """Return only the approved always-allow destination IPs"""
@@ -3893,102 +3401,18 @@ class AellaCli(cmd.Cmd, object):
         if not param or param[0].endswith('?') or len(param) < 1:
             print('\n<NTP server> \t Specify NTP server name or IP address\n')
             return
-
-        # Detect NTP type
-        ntp_backend, ntp_conf, service_name = self._detect_ntp_type()
-
-        try:
-            if ntp_backend == "ntpsec":
-                if not ntp_conf or not os.path.exists(ntp_conf):
-                    print("NTP config file not found. Please ensure NTP service is installed.\n")
-                    return 1
-
-                force = False
-                target_tokens = param
-                if param[0] == "--force":
-                    force = True
-                    target_tokens = param[1:]
-
-                if not target_tokens:
-                    print('\n<NTP server> \t Specify NTP server name or IP address\n')
-                    return 1
-
-                target_raw = " ".join(target_tokens).strip()
-                target = self._normalize_ntp_target(target_raw)
-
-                block_entries = self._read_ntpsec_block_entries(ntp_conf)
-                block_targets = [self._normalize_ntp_target(self._extract_ntp_entry_target(entry)) for entry in block_entries]
-                conf_entries = self._read_ntpsec_conf_entries(ntp_conf)
-                conf_targets = [self._normalize_ntp_target(self._extract_ntp_entry_target(entry)) for entry in conf_entries]
-
-                removed = False
-                if target in block_targets:
-                    removed = self._remove_ntpsec_block_target(ntp_conf, target)
-                    if not removed:
-                        print("NTP server {} not found in configuration\n".format(target_raw))
-                        return 1
-                elif target in conf_targets:
-                    if not force:
-                        print("Target exists in ntp.conf but is not CLI-managed. Use: unset ntp --force <target>")
-                        return 1
-                    removed = self._remove_ntpsec_conf_target(ntp_conf, target)
-                    if not removed:
-                        print("NTP server {} not found in configuration\n".format(target_raw))
-                        return 1
-                else:
-                    print("NTP server {} not found in configuration\n".format(target_raw))
-                    return 1
-
-                if not self._restart_ntp_service(service_name):
-                    return 1
-
-                ntpq_proc = subprocess.run(
-                    ["ntpq", "-pn"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                warnings = []
-                warning_needed = True
-                if ntpq_proc.returncode == 0:
-                    peers, reachable, _ = self._parse_ntpq_output(ntpq_proc.stdout)
-                    if peers and reachable:
-                        warning_needed = False
-                if warning_needed:
-                    warnings.append("NTP configured but peers not reachable yet")
-                    warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
-
-                print("Successfully unset ntp {}\n".format(target_raw))
-                for line in warnings:
-                    print(line)
-                return 0
-
-            timesyncd_conf = "/etc/systemd/timesyncd.conf"
-            server_list = self._read_timesyncd_ntp_servers(timesyncd_conf)
-            if param[0] not in server_list:
-                print("NTP server {} not found in configuration\n".format(param[0]))
-                return 1
-
-            server_list = [s for s in server_list if s != param[0]]
-            self._write_timesyncd_conf(timesyncd_conf, server_list)
-            if not self._restart_ntp_service(service_name):
-                return 1
-
-            server, _, _, error = self._get_timesync_status()
-            warnings = []
-            if error or not server or "ntp.ubuntu.com" in server:
-                warnings.append("NTP configured but peers not reachable yet")
-                warnings.append("This may be normal for a short time, or indicate DNS/UDP123 issues")
-
-            print("Successfully unset ntp {}\n".format(param[0]))
-            for line in warnings:
-                print(line)
-            return 0
-            
-        except Exception as e:
-            print("Failed to unset ntp {}: {}\n".format(param[0], e))
+        if "--force" in param:
+            print("--force is not supported; only CLI-managed NTP peers may be removed")
             return 1
+        target = self._normalize_ntp_target(" ".join(param))
+        if not self._is_valid_ntp_target(target):
+            print("Invalid NTP hostname: Please enter the correct hostname")
+            return 1
+        if self._ntpsec_operation("unset", [target]):
+            print("Successfully unset ntp {}\n".format(" ".join(param)))
+            return 0
+        return 1
+
 
     def unset_acl_callback(self, key, param):
         """
@@ -4122,6 +3546,26 @@ class AellaCli(cmd.Cmd, object):
             print('Use "show acl" to see current rules.\n')
 
     def unset_interface_callback(self, key, param):
+        if param and param[0].rstrip("?") == "mgt":
+            if len(param) < 2 or param[0].endswith("?"):
+                print("\nip         Unset management IP address and netmask")
+                print("gateway    Unset management default gateway")
+                print("restart    Restart management interface\n")
+                return
+            option = param[1]
+            if option == "ip":
+                changed = self._apply_mgt_transaction(remove_address=True, remove_netmask=True)
+            elif option == "gateway":
+                changed = self._apply_mgt_transaction(remove_gateway=True)
+            elif option == "restart":
+                self._apply_mgt_transaction(restart=True)
+                return
+            else:
+                print('Invalid option: Available options are "ip", "gateway" and "restart"')
+                return
+            if changed and self._mgt_last_changed:
+                print("Run 'unset interface mgt restart' command to apply the changes.\n")
+            return
         if self.is_sensor_host_mode():
             self.unset_interface_sensor(param)
             return
@@ -4231,8 +3675,12 @@ class AellaCli(cmd.Cmd, object):
         self.shell_cmd_exec('hostname')
 
     def is_valid_hostname(self, hostname):
+        if not hostname:
+            return False
         if hostname[-1] == ".":
             hostname = hostname[:-1]
+        if not hostname:
+            return False
         allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
         return all(allowed.match(x) for x in hostname.split("."))
 
@@ -4909,17 +4357,12 @@ class AellaCli(cmd.Cmd, object):
             print(msg)
 
     def write_full_interfaces_file(self, lines):
-        main_path = "/etc/network/interfaces"
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        backup_path = "{}.bak.{}".format(main_path, timestamp)
+        main_path = NETWORK_INTERFACES_PATH
         try:
-            if os.path.exists(main_path):
-                with open(main_path, 'r') as f:
-                    existing = f.read()
-                with open(backup_path, 'w') as f:
-                    f.write(existing)
-            with open(main_path, 'w') as f:
-                f.write("\n".join([line.rstrip("\n") for line in lines]) + "\n")
+            _atomic_replace_text_file(
+                main_path,
+                "\n".join([line.rstrip("\n") for line in lines]) + "\n",
+            )
             with open(main_path, 'r') as f:
                 final = f.read()
             if not final.strip():
@@ -4939,6 +4382,9 @@ class AellaCli(cmd.Cmd, object):
         For DP appliances: mgt in /etc/network/interfaces, data1g/data10g in interfaces.d/
         For Sensor/KVM installers: mgt/host/hostmgmt in /etc/network/interfaces.d/*.cfg
         """
+        if interface == "mgt":
+            print("Management interface must use the canonical management editor")
+            return False
         try:
             for line in contents:
                 if re.match(r'^\s*source\s+/etc/network/interfaces\.d/\*', line):
@@ -5082,6 +4528,420 @@ class AellaCli(cmd.Cmd, object):
                 parsed["dns"] = dns_list
         return parsed
 
+    @staticmethod
+    def _read_text_exact(path):
+        with open(path, "r", encoding="utf-8", newline="") as stream:
+            return stream.read()
+
+    @staticmethod
+    def _mgt_static_stanza_bounds(text):
+        lines = text.splitlines(keepends=True)
+        starts = [
+            index for index, line in enumerate(lines)
+            if re.match(r"^\s*iface\s+mgt\s+inet\s+static(?:\s*(?:#.*)?)?(?:\r?\n)?$", line)
+        ]
+        if len(starts) != 1:
+            raise ValueError(
+                "Canonical management configuration must contain exactly one "
+                "'iface mgt inet static' stanza"
+            )
+        start = starts[0]
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            if re.match(r"^\s*iface\s+\S+\s+", lines[index]):
+                end = index
+                break
+        return lines, start, end
+
+    def _render_mgt_ipv4_config(
+        self,
+        original,
+        address=None,
+        netmask=None,
+        gateway=None,
+        dns_nameservers=None,
+        remove_address=False,
+        remove_netmask=False,
+        remove_gateway=False,
+        remove_dns=False,
+    ):
+        lines, start, end = self._mgt_static_stanza_bounds(original)
+        replacements = {
+            "address": (address, remove_address),
+            "netmask": (netmask, remove_netmask),
+            "gateway": (gateway, remove_gateway),
+            "dns-nameservers": (dns_nameservers, remove_dns),
+        }
+        if address is not None:
+            try:
+                ipaddress.IPv4Address(address)
+            except Exception as exc:
+                raise ValueError("Invalid management IPv4 address") from exc
+        if netmask is not None:
+            try:
+                network = ipaddress.IPv4Network("0.0.0.0/{}".format(netmask))
+                netmask = str(network.netmask)
+                replacements["netmask"] = (netmask, remove_netmask)
+            except Exception as exc:
+                raise ValueError("Invalid management IPv4 netmask") from exc
+        if gateway is not None:
+            try:
+                ipaddress.IPv4Address(gateway)
+            except Exception as exc:
+                raise ValueError("Invalid management gateway") from exc
+        if dns_nameservers is not None:
+            if isinstance(dns_nameservers, str):
+                dns_nameservers = dns_nameservers.split()
+            normalized_dns = []
+            for dns in dns_nameservers:
+                try:
+                    normalized_dns.append(str(ipaddress.IPv4Address(dns)))
+                except Exception as exc:
+                    raise ValueError("Invalid management DNS server: {}".format(dns)) from exc
+            replacements["dns-nameservers"] = (normalized_dns, remove_dns)
+
+        directive_indexes = {name: [] for name in replacements}
+        indent = None
+        newline = "\r\n" if "\r\n" in original else "\n"
+        for index in range(start + 1, end):
+            match = re.match(r"^(\s*)(address|netmask|gateway|dns-nameservers)\s+", lines[index])
+            if match:
+                directive_indexes[match.group(2)].append(index)
+                if indent is None:
+                    indent = match.group(1)
+        indent = indent if indent is not None else "    "
+
+        output = list(lines)
+        insertions = []
+        for name, (value, remove) in replacements.items():
+            indexes = directive_indexes[name]
+            if remove:
+                for index in indexes:
+                    output[index] = ""
+                continue
+            if value is None:
+                for index in indexes[1:]:
+                    output[index] = ""
+                continue
+            rendered_value = " ".join(value) if name == "dns-nameservers" else str(value)
+            if indexes:
+                original_line = lines[indexes[0]]
+                original_body = original_line.rstrip("\r\n")
+                original_newline = original_line[len(original_body):]
+                original_indent = re.match(r"^(\s*)", original_body).group(1)
+                inline_comment = re.search(r"(\s+#.*)$", original_body)
+                comment_suffix = inline_comment.group(1) if inline_comment else ""
+                output[indexes[0]] = "{}{} {}{}{}".format(
+                    original_indent,
+                    name,
+                    rendered_value,
+                    comment_suffix,
+                    original_newline,
+                )
+                for index in indexes[1:]:
+                    output[index] = ""
+            else:
+                insertions.append(
+                    "{}{} {}{}".format(indent, name, rendered_value, newline)
+                )
+        if insertions:
+            output[end:end] = insertions
+        return "".join(output)
+
+    def _update_mgt_ipv4_config(
+        self,
+        ip_cidr=None,
+        gateway=None,
+        dns_servers=None,
+        remove_ip=False,
+        remove_gateway=False,
+        remove_dns=False,
+    ):
+        changes = {
+            "gateway": gateway,
+            "dns_nameservers": dns_servers,
+            "remove_address": remove_ip,
+            "remove_netmask": remove_ip,
+            "remove_gateway": remove_gateway,
+            "remove_dns": remove_dns,
+        }
+        if ip_cidr is not None:
+            try:
+                value = ipaddress.IPv4Interface(ip_cidr)
+            except Exception as exc:
+                raise ValueError("Invalid management IP address: {}".format(ip_cidr)) from exc
+            changes["address"] = str(value.ip)
+            changes["netmask"] = str(value.network.netmask)
+        return self._apply_mgt_transaction(**changes)
+
+    @staticmethod
+    def _remove_mgt_from_noncanonical_text(text):
+        lines = text.splitlines(keepends=True)
+        output = []
+        changed = False
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            activation = re.match(
+                r"^(\s*)(auto|allow-hotplug)(\s+)([^#\r\n]*?)(\s*(?:#.*)?)(\r?\n)?$",
+                line,
+            )
+            if activation:
+                tokens = activation.group(4).split()
+                if "mgt" in tokens:
+                    changed = True
+                    tokens = [token for token in tokens if token != "mgt"]
+                    if tokens:
+                        output.append(
+                            "{}{}{}{}{}{}".format(
+                                activation.group(1), activation.group(2), activation.group(3),
+                                " ".join(tokens), activation.group(5), activation.group(6) or "",
+                            )
+                        )
+                    index += 1
+                    continue
+            if re.match(r"^\s*iface\s+mgt\s+inet\s+static(?:\s|$)", line):
+                changed = True
+                index += 1
+                while index < len(lines) and not re.match(
+                    r"^\s*(iface|auto|allow-hotplug|source|source-directory|mapping)\b",
+                    lines[index],
+                ):
+                    index += 1
+                continue
+            output.append(line)
+            index += 1
+        return "".join(output), changed
+
+    def _collect_mgt_transaction(self, **changes):
+        if not os.path.isfile(MGT_CONFIG_PATH):
+            raise ValueError("Management configuration not found: {}".format(MGT_CONFIG_PATH))
+        originals = {MGT_CONFIG_PATH: self._read_text_exact(MGT_CONFIG_PATH)}
+        updated = {
+            MGT_CONFIG_PATH: self._render_mgt_ipv4_config(originals[MGT_CONFIG_PATH], **changes)
+        }
+        candidates = []
+        if os.path.isfile(NETWORK_INTERFACES_PATH):
+            candidates.append(NETWORK_INTERFACES_PATH)
+        if os.path.isdir(NETWORK_INTERFACES_DIR):
+            for name in sorted(os.listdir(NETWORK_INTERFACES_DIR)):
+                path = os.path.join(NETWORK_INTERFACES_DIR, name)
+                if name.endswith(".cfg") and path != MGT_CONFIG_PATH and os.path.isfile(path):
+                    candidates.append(path)
+        final_texts = {MGT_CONFIG_PATH: updated[MGT_CONFIG_PATH]}
+        for path in candidates:
+            original = self._read_text_exact(path)
+            cleaned, changed = self._remove_mgt_from_noncanonical_text(original)
+            final_texts[path] = cleaned
+            if changed:
+                originals[path] = original
+                updated[path] = cleaned
+        static_locations = []
+        for path, text in final_texts.items():
+            count = len(re.findall(
+                r"(?m)^\s*iface\s+mgt\s+inet\s+static(?:\s*(?:#.*)?)?$",
+                text,
+            ))
+            static_locations.extend([path] * count)
+        if static_locations != [MGT_CONFIG_PATH]:
+            raise ValueError(
+                "Management configuration must contain exactly one canonical "
+                "'iface mgt inet static' stanza"
+            )
+        return originals, updated
+
+    @staticmethod
+    def _restore_text_files(originals, paths):
+        failed_paths = []
+        for path in reversed(paths):
+            try:
+                _atomic_replace_text_file(path, originals[path])
+            except Exception:
+                failed_paths.append(path)
+        return list(reversed(failed_paths))
+
+    def _apply_mgt_transaction(self, restart=False, **changes):
+        self._mgt_last_changed = False
+        try:
+            originals, updated = self._collect_mgt_transaction(**changes)
+        except Exception as exc:
+            if str(exc).startswith("Management configuration not found:"):
+                print(str(exc))
+            else:
+                print("Failed to update management configuration: {}".format(exc))
+            return False
+        write_order = [path for path in updated if path != MGT_CONFIG_PATH]
+        write_order.append(MGT_CONFIG_PATH)
+        changed_paths = [path for path in write_order if updated[path] != originals[path]]
+        self._mgt_last_changed = bool(changed_paths)
+        prepared = {}
+        written = []
+        try:
+            for path in changed_paths:
+                prepared[path] = _prepare_atomic_text_file(path, updated[path])
+        except Exception as exc:
+            for temporary_path in prepared.values():
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+            self._mgt_last_changed = False
+            print("Failed to prepare management configuration: {}".format(exc))
+            return False
+        try:
+            for path in changed_paths:
+                try:
+                    _commit_prepared_text_file(path, prepared[path])
+                except _AtomicCommitError as exc:
+                    if exc.replaced:
+                        written.append(path)
+                    raise
+                written.append(path)
+        except Exception as exc:
+            failed_restore_paths = self._restore_text_files(originals, written)
+            self._mgt_last_changed = False
+            print("Failed to update management configuration: {}".format(exc))
+            if failed_restore_paths:
+                print(
+                    "CRITICAL: Failed to restore management configuration: {}".format(
+                        ", ".join(map(os.fspath, failed_restore_paths))
+                    )
+                )
+            return False
+        finally:
+            for temporary_path in prepared.values():
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+        if restart and not self._restart_mgt_interface():
+            failed_restore_paths = self._restore_text_files(originals, written)
+            self._mgt_last_changed = False
+            if failed_restore_paths:
+                print(
+                    "CRITICAL: Failed to restore management configuration: {}".format(
+                        ", ".join(map(os.fspath, failed_restore_paths))
+                    )
+                )
+            return False
+        return True
+
+    def _restart_mgt_interface(self):
+        try:
+            canonical = self._read_text_exact(MGT_CONFIG_PATH)
+            lines, start, end = self._mgt_static_stanza_bounds(canonical)
+            address = None
+            netmask = None
+            gateway = None
+            for line in lines[start + 1:end]:
+                match = re.match(r"^\s*(address|netmask|gateway)\s+(\S+)", line)
+                if not match:
+                    continue
+                if match.group(1) == "address":
+                    address = match.group(2)
+                elif match.group(1) == "netmask":
+                    netmask = match.group(2)
+                else:
+                    gateway = match.group(2)
+            expected_ip = None
+            if address and netmask:
+                prefix = ipaddress.IPv4Network("0.0.0.0/{}".format(netmask)).prefixlen
+                expected_ip = "{}/{}".format(address, prefix)
+            elif address:
+                raise ValueError("Management address requires a netmask")
+        except Exception as exc:
+            print("Failed to read management configuration: {}".format(exc))
+            return False
+        commands = [
+            ["ifup", "--no-act", "mgt"],
+            ["sudo", "ifdown", "--force", "mgt"],
+            ["sudo", "ifup", "mgt"],
+        ]
+        for command in commands:
+            proc = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if proc.returncode != 0:
+                error = (proc.stderr or "").strip()
+                message = "Failed to restart management interface: {}".format(
+                    " ".join(command)
+                )
+                if error:
+                    message += ": {}".format(error)
+                print(message)
+                return False
+        addr = subprocess.run(
+            ["ip", "-4", "addr", "show", "dev", "mgt"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        route = subprocess.run(
+            ["ip", "-4", "route", "show", "table", "main", "default"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        runtime_addr = addr.stdout or ""
+        has_mgt_ipv4 = bool(re.search(r"\binet\s+\d{1,3}(?:\.\d{1,3}){3}/\d+\b", runtime_addr))
+        address_mismatch = (
+            expected_ip
+            and not re.search(r"\binet\s+{}\b".format(re.escape(expected_ip)), runtime_addr)
+        )
+        unexpected_address = not expected_ip and has_mgt_ipv4
+        if addr.returncode != 0 or address_mismatch or unexpected_address:
+            print("Failed to verify management IPv4 address")
+            return False
+        runtime_routes = route.stdout or ""
+        expected_gateway_missing = gateway and not re.search(
+            r"(?m)^\s*default\s+via\s+{}\s+dev\s+mgt(?:\s|$)".format(
+                re.escape(gateway)
+            ),
+            runtime_routes,
+        )
+        unexpected_gateway = not gateway and re.search(
+            r"(?m)^\s*default(?:\s+via\s+\S+)?\s+dev\s+mgt(?:\s|$)",
+            runtime_routes,
+        )
+        if route.returncode != 0 or expected_gateway_missing or unexpected_gateway:
+            print("Failed to verify main routing table")
+            return False
+        return True
+
+    def _set_mgt_interface(self, param):
+        if len(param) < 2:
+            print("Management interface option is required")
+            return False
+        if param[1] == "restart":
+            if self._apply_mgt_transaction(restart=True):
+                print("Management interface restarted successfully.")
+                return True
+            return False
+        try:
+            parsed = self._parse_set_interface_args(param[1:])
+        except ValueError as exc:
+            print(str(exc))
+            return False
+        changes = {
+            "gateway": parsed["gateway"],
+            "dns_nameservers": parsed["dns"] or None,
+        }
+        if parsed["ip"] is not None:
+            try:
+                value = ipaddress.IPv4Interface(parsed["ip"])
+            except Exception:
+                print("Invalid IP address format: {}".format(parsed["ip"]))
+                return False
+            changes["address"] = str(value.ip)
+            changes["netmask"] = str(value.network.netmask)
+        result = self._apply_mgt_transaction(restart=parsed["restart"], **changes)
+        if not result:
+            return False
+        if parsed["restart"]:
+            print("Management interface restarted successfully.")
+            return True
+        if self._mgt_last_changed:
+            print("Configuration updated successfully.")
+            print("Run 'set interface mgt restart' to apply the changes.")
+        return True
+
     _SENSOR_IFACE_CFG_HINTS = {
         "mgt": ["01-mgt.cfg"],
         "host": ["01-host.cfg"],
@@ -5146,17 +5006,9 @@ class AellaCli(cmd.Cmd, object):
         return "/etc/network/interfaces"
 
     def _write_iface_config_file_with_backup(self, path, contents):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        backup_path = "{}.bak.{}".format(path, timestamp)
         try:
-            if os.path.exists(path):
-                with open(path, 'r') as f:
-                    existing = f.read()
-                with open(backup_path, 'w') as f:
-                    f.write(existing)
             normalized = [line.rstrip("\n") for line in contents]
-            with open(path, 'w') as f:
-                f.write("\n".join(normalized) + "\n")
+            _atomic_replace_text_file(path, "\n".join(normalized) + "\n")
             return True
         except Exception as e:
             print('Failed to update interface configuration')
@@ -5319,17 +5171,9 @@ class AellaCli(cmd.Cmd, object):
         return mode, address, netmask, dns_list, block_lines
 
     def _write_interfaces_file_with_backup(self, contents):
-        main_path = "/etc/network/interfaces"
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        backup_path = "{}.bak.{}".format(main_path, timestamp)
+        main_path = NETWORK_INTERFACES_PATH
         try:
-            if os.path.exists(main_path):
-                with open(main_path, 'r') as f:
-                    existing = f.read()
-                with open(backup_path, 'w') as f:
-                    f.write(existing)
-            with open(main_path, 'w') as f:
-                f.write("\n".join(contents) + "\n")
+            _atomic_replace_text_file(main_path, "\n".join(contents) + "\n")
             return True
         except Exception as e:
             print('Failed to update interface configuration')
@@ -5372,6 +5216,9 @@ class AellaCli(cmd.Cmd, object):
         return self.update_interface_file(config_interface, new_block)
 
     def _apply_interface_config(self, interface, ip=None, gateway=None, dns_list=None):
+        if interface == "mgt":
+            print("Management interface cannot be modified by the generic interface editor.")
+            return False
         config_interface = self._resolve_iface_config_name(interface)
         lines = self._read_interface_config_lines(config_interface)
         if dns_list is None:
@@ -5521,14 +5368,16 @@ class AellaCli(cmd.Cmd, object):
                 updated.append(line)
             if changed:
                 try:
-                    with open(path, 'w') as f:
-                        f.writelines(updated)
+                    _atomic_replace_text_file(path, "".join(updated))
                 except Exception:
                     continue
 
     def set_interface_callback2(self, param):
         status = 0
         output = None
+        if param and param[0] == "mgt":
+            print("Management interface cannot be modified by the generic interface callback.")
+            return False
         try:
             CLOUD_INIT_FILE = "/etc/network/interfaces.d/50-cloud-init.cfg"
             if os.path.isfile(CLOUD_INIT_FILE):
@@ -5828,6 +5677,8 @@ class AellaCli(cmd.Cmd, object):
         return None
 
     def _restart_interface_with_verification(self, interface):
+        if interface == "mgt":
+            return self._restart_mgt_interface()
         expected_ip, expected_dns = self._get_interface_expected_config(interface)
         expected_gateway = self._get_interface_gateway(interface)
         self._ensure_interfaces_base()
@@ -5855,10 +5706,6 @@ class AellaCli(cmd.Cmd, object):
 
         if expected_gateway and self.is_sensor_host_mode():
             if not self._ensure_host_gateway(interface, expected_gateway):
-                return False
-
-        if interface == "mgt" and expected_gateway and not self.is_sensor_host_mode():
-            if not self._ensure_mgt_gateway(interface, expected_gateway):
                 return False
 
         print("Restart completed.\n")
@@ -5891,34 +5738,9 @@ class AellaCli(cmd.Cmd, object):
         print("Failed to verify host default gateway")
         return False
 
-    def _ensure_mgt_gateway(self, interface, gateway):
-        cmd_show = "ip route show table 1 | grep default"
-        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        out, _ = proc.communicate()
-        if out:
-            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
-            if m and m.group(1) == gateway and m.group(2) == interface:
-                return True
-
-        cmd_set = "ip route replace default via {} dev {} table 1".format(gateway, interface)
-        set_proc = subprocess.run(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if set_proc.returncode != 0:
-            err_msg = set_proc.stderr.strip() if set_proc.stderr else set_proc.stdout.strip()
-            err_msg = err_msg if err_msg else "Unknown error"
-            print("Failed to apply management gateway: {}".format(err_msg))
-            return False
-
-        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        out, _ = proc.communicate()
-        if out:
-            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
-            if m and m.group(1) == gateway and m.group(2) == interface:
-                return True
-
-        print("Failed to verify management gateway in table 1")
-        return False
-
     def restart_new_network_manager(self, interface, expected_ip=None, expected_dns=None):
+        if interface == "mgt":
+            return self._restart_mgt_interface()
         try:
             rm_proc = subprocess.run(
                 "rm -f /run/resolvconf/interface/{0}.dhclient".format(interface),
@@ -6092,6 +5914,16 @@ class AellaCli(cmd.Cmd, object):
 
 
     def set_interface_callback(self, key, param):
+        filtered = [p for p in param if p != ""]
+        if filtered and filtered[0].rstrip("?") == "mgt":
+            if filtered[0].endswith("?") or len(filtered) == 1:
+                print('\nip <IP Address/Netmask>   Specify interface IP address and netmask')
+                print('gateway <IP Address>      Specify default gateway IP address')
+                print('dns <IP Address> [...]    Specify DNS server IP address(es)')
+                print('restart                   Restart network interface\n')
+                return
+            self._set_mgt_interface(filtered)
+            return
         if self.is_sensor_host_mode():
             self.set_interface_sensor(param)
             return
