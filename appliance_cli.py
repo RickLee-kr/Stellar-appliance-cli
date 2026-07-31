@@ -4823,6 +4823,12 @@ class AellaCli(cmd.Cmd, object):
                         ", ".join(map(os.fspath, failed_restore_paths))
                     )
                 )
+            elif not self._restart_mgt_interface():
+                print(
+                    "CRITICAL: The previous management configuration was restored "
+                    "on disk but could not be re-applied to the live interface. "
+                    "Manual network recovery is required."
+                )
             return False
         return True
 
@@ -4846,12 +4852,67 @@ class AellaCli(cmd.Cmd, object):
             expected_ip = None
             if address and netmask:
                 prefix = ipaddress.IPv4Network("0.0.0.0/{}".format(netmask)).prefixlen
-                expected_ip = "{}/{}".format(address, prefix)
+                expected_ip = str(ipaddress.IPv4Interface("{}/{}".format(address, prefix)))
             elif address:
                 raise ValueError("Management address requires a netmask")
         except Exception as exc:
             print("Failed to read management configuration: {}".format(exc))
             return False
+
+        def read_runtime_addresses():
+            proc = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "dev", "mgt", "scope", "global"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            if proc.returncode != 0:
+                error = (proc.stderr or "").strip()
+                message = "Failed to read management IPv4 addresses"
+                if error:
+                    message += ": {}".format(error)
+                print(message)
+                return None
+
+            addresses = []
+            for match in re.finditer(r"\binet\s+(\S+)", proc.stdout or ""):
+                try:
+                    normalized = str(ipaddress.IPv4Interface(match.group(1)))
+                except Exception:
+                    print(
+                        "Failed to parse management IPv4 address: {}".format(
+                            match.group(1)
+                        )
+                    )
+                    return None
+                addresses.append(normalized)
+            return addresses
+
+        def read_runtime_routes():
+            proc = subprocess.run(
+                ["ip", "-4", "route", "show", "table", "main", "default"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            if proc.returncode != 0:
+                error = (proc.stderr or "").strip()
+                message = "Failed to read main routing table"
+                if error:
+                    message += ": {}".format(error)
+                print(message)
+                return None
+            return proc.stdout or ""
+
+        def verify_expected_route(runtime_routes):
+            expected_gateway_missing = gateway and not re.search(
+                r"(?m)^\s*default\s+via\s+{}\s+dev\s+mgt(?:\s|$)".format(
+                    re.escape(gateway)
+                ),
+                runtime_routes,
+            )
+            unexpected_gateway = not gateway and re.search(
+                r"(?m)^\s*default(?:\s+via\s+\S+)?\s+dev\s+mgt(?:\s|$)",
+                runtime_routes,
+            )
+            return not expected_gateway_missing and not unexpected_gateway
+
         commands = [
             ["ifup", "--no-act", "mgt"],
             ["sudo", "ifdown", "--force", "mgt"],
@@ -4871,36 +4932,72 @@ class AellaCli(cmd.Cmd, object):
                     message += ": {}".format(error)
                 print(message)
                 return False
-        addr = subprocess.run(
-            ["ip", "-4", "addr", "show", "dev", "mgt"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
-        )
-        route = subprocess.run(
-            ["ip", "-4", "route", "show", "table", "main", "default"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
-        )
-        runtime_addr = addr.stdout or ""
-        has_mgt_ipv4 = bool(re.search(r"\binet\s+\d{1,3}(?:\.\d{1,3}){3}/\d+\b", runtime_addr))
-        address_mismatch = (
-            expected_ip
-            and not re.search(r"\binet\s+{}\b".format(re.escape(expected_ip)), runtime_addr)
-        )
-        unexpected_address = not expected_ip and has_mgt_ipv4
-        if addr.returncode != 0 or address_mismatch or unexpected_address:
-            print("Failed to verify management IPv4 address")
+
+        # The configuration file has already been replaced at this point.  An
+        # ifdown based on the new file can therefore leave the old runtime IP on
+        # the interface.  Before deleting anything, first make sure the new IP
+        # and its route are live so an invalid new configuration does not remove
+        # the only working management address.
+        runtime_addresses = read_runtime_addresses()
+        if runtime_addresses is None:
             return False
-        runtime_routes = route.stdout or ""
-        expected_gateway_missing = gateway and not re.search(
-            r"(?m)^\s*default\s+via\s+{}\s+dev\s+mgt(?:\s|$)".format(
-                re.escape(gateway)
-            ),
-            runtime_routes,
-        )
-        unexpected_gateway = not gateway and re.search(
-            r"(?m)^\s*default(?:\s+via\s+\S+)?\s+dev\s+mgt(?:\s|$)",
-            runtime_routes,
-        )
-        if route.returncode != 0 or expected_gateway_missing or unexpected_gateway:
+        if expected_ip and expected_ip not in runtime_addresses:
+            print(
+                "Failed to verify new management IPv4 address: expected {}, found {}".format(
+                    expected_ip,
+                    ", ".join(runtime_addresses) if runtime_addresses else "none",
+                )
+            )
+            return False
+
+        runtime_routes = read_runtime_routes()
+        if runtime_routes is None or not verify_expected_route(runtime_routes):
+            print("Failed to verify main routing table")
+            return False
+
+        # Converge the live interface to the canonical configuration.  Keep the
+        # expected address and remove every stale global IPv4 address left by
+        # the previous configuration.  For an explicit unset, remove them all.
+        stale_addresses = [
+            item for item in runtime_addresses if expected_ip is None or item != expected_ip
+        ]
+        for stale_address in stale_addresses:
+            proc = subprocess.run(
+                ["sudo", "ip", "-4", "addr", "del", stale_address, "dev", "mgt"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            if proc.returncode != 0:
+                # The address may have disappeared asynchronously.  Re-read it
+                # before treating the deletion as a failure.
+                current_addresses = read_runtime_addresses()
+                if current_addresses is None or stale_address in current_addresses:
+                    error = (proc.stderr or "").strip()
+                    message = "Failed to remove stale management IPv4 address {}".format(
+                        stale_address
+                    )
+                    if error:
+                        message += ": {}".format(error)
+                    print(message)
+                    return False
+
+        final_addresses = read_runtime_addresses()
+        if final_addresses is None:
+            return False
+        expected_addresses = [expected_ip] if expected_ip else []
+        if sorted(final_addresses) != sorted(expected_addresses):
+            print(
+                "Failed to converge management IPv4 addresses: expected {}, found {}".format(
+                    ", ".join(expected_addresses) if expected_addresses else "none",
+                    ", ".join(final_addresses) if final_addresses else "none",
+                )
+            )
+            return False
+
+        # Re-check the route after stale addresses have been removed.  The CLI
+        # reports success only when both the persistent file and live state are
+        # consistent with the requested management configuration.
+        runtime_routes = read_runtime_routes()
+        if runtime_routes is None or not verify_expected_route(runtime_routes):
             print("Failed to verify main routing table")
             return False
         return True
