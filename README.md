@@ -43,7 +43,7 @@ Key areas covered:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/RickLee-kr/Stellar-appliance-cli.git
+   git clone https://github.com/xdr-labs/Stellar-appliance-cli.git
    cd "Stellar appliance cli"
    ```
 
@@ -62,7 +62,7 @@ Key areas covered:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/RickLee-kr/Stellar-appliance-cli.git
+   git clone https://github.com/xdr-labs/Stellar-appliance-cli.git
    cd "Stellar appliance cli"
    ```
 
